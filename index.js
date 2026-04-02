@@ -21,10 +21,29 @@ const wss = new WebSocketServer({ server })
 let sock = null
 let qrCode = null
 let connected = false
-let messages = {}   // { jid: [entry] }
-let contacts = {}   // { jid: contact }  — only @s.whatsapp.net (individual)
-let channels = {}   // { jid: contact }  — @newsletter
-let archived = new Set() // jids arquivados manualmente
+let messages = {}      // { jid: [entry] }
+let contacts = {}      // { jid: contact } — @s.whatsapp.net
+let channels = {}      // { jid: contact } — @newsletter
+let customNames = {}   // { jid: string } — nomes customizados pelo usuário
+let archived = new Set()
+
+// Persiste dados em arquivo para sobreviver a reinicializações
+const DATA_FILE = path.join(__dirname, "data.json")
+const loadData = () => {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))
+      customNames = d.customNames || {}
+      archived = new Set(d.archived || [])
+    }
+  } catch {}
+}
+const saveData = () => {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ customNames, archived: [...archived] }))
+  } catch {}
+}
+loadData()
 
 const broadcast = (data) => {
   wss.clients.forEach(client => {
@@ -38,26 +57,42 @@ const getMediaType = (m) => {
   if (m?.audioMessage) return "audio"
   if (m?.documentMessage) return "document"
   if (m?.stickerMessage) return "sticker"
-  if (m?.ptvMessage) return "video" // video note
+  if (m?.ptvMessage) return "video"
   return null
 }
 
-const isViewOnce = (m) => {
-  return !!(
-    m?.imageMessage?.viewOnce ||
-    m?.videoMessage?.viewOnce ||
-    m?.viewOnceMessage ||
-    m?.viewOnceMessageV2 ||
-    m?.viewOnceMessageV2Extension
-  )
+const isViewOnce = (m) => !!(
+  m?.imageMessage?.viewOnce || m?.videoMessage?.viewOnce ||
+  m?.viewOnceMessage || m?.viewOnceMessageV2 || m?.viewOnceMessageV2Extension
+)
+
+const getBodyText = (m) => m?.conversation || m?.extendedTextMessage?.text || null
+
+const buildName = (jid, pushName) => {
+  if (customNames[jid]) return customNames[jid]
+  return pushName || jid.split("@")[0]
 }
 
-const getBodyText = (m) => {
-  return (
-    m?.conversation ||
-    m?.extendedTextMessage?.text ||
-    null
-  )
+// Carrega histórico de chats ao conectar
+const loadChats = async () => {
+  try {
+    const chats = await sock.groupFetchAllParticipating?.() // só para verificar se sock está ativo
+  } catch {}
+
+  // Carrega contatos do store do Baileys
+  try {
+    const waContacts = sock.store?.contacts || {}
+    Object.entries(waContacts).forEach(([jid, c]) => {
+      if (jid.endsWith("@s.whatsapp.net")) {
+        const name = buildName(jid, c.name || c.notify || c.verifiedName)
+        if (!contacts[jid]) {
+          contacts[jid] = { jid, name, lastMessage: "", timestamp: 0, unread: 0, archived: archived.has(jid) }
+        }
+      }
+    })
+  } catch {}
+
+  broadcast({ type: "chats_loaded" })
 }
 
 const startSock = async () => {
@@ -70,6 +105,7 @@ const startSock = async () => {
     version,
     auth: state,
     browser: ["TraderHub", "Chrome", "1.0.0"],
+    syncFullHistory: false,
   })
 
   sock.ev.on("creds.update", saveCreds)
@@ -85,6 +121,7 @@ const startSock = async () => {
       connected = true
       broadcast({ type: "connected" })
       console.log("WhatsApp conectado!")
+      setTimeout(loadChats, 2000)
     }
     if (connection === "close") {
       connected = false
@@ -103,15 +140,57 @@ const startSock = async () => {
     }
   })
 
+  // Recebe contatos do WhatsApp
+  sock.ev.on("contacts.upsert", (list) => {
+    list.forEach(c => {
+      if (!c.id) return
+      const name = buildName(c.id, c.name || c.notify || c.verifiedName)
+      if (c.id.endsWith("@s.whatsapp.net")) {
+        if (!contacts[c.id]) contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0 }
+        else contacts[c.id].name = name
+      } else if (c.id.endsWith("@newsletter")) {
+        if (!channels[c.id]) channels[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0 }
+        else channels[c.id].name = name
+      }
+    })
+    broadcast({ type: "contacts_updated" })
+  })
+
+  sock.ev.on("contacts.update", (updates) => {
+    updates.forEach(c => {
+      if (!c.id) return
+      const name = buildName(c.id, c.notify || c.name)
+      if (contacts[c.id]) contacts[c.id].name = name
+      else if (channels[c.id]) channels[c.id].name = name
+    })
+  })
+
+  // Recebe lista de chats (conversas existentes)
+  sock.ev.on("chats.upsert", (list) => {
+    list.forEach(chat => {
+      const jid = chat.id
+      if (!jid) return
+      if (jid === "status@broadcast" || jid.endsWith("@g.us")) return
+      const isChannel = jid.endsWith("@newsletter")
+      const name = buildName(jid, chat.name)
+      const store = isChannel ? channels : contacts
+      if (!store[jid]) {
+        store[jid] = { jid, name, lastMessage: "", timestamp: chat.conversationTimestamp || 0, unread: chat.unreadCount || 0, archived: archived.has(jid) }
+      } else {
+        if (!customNames[jid]) store[jid].name = name
+        store[jid].timestamp = chat.conversationTimestamp || store[jid].timestamp
+        store[jid].unread = chat.unreadCount || store[jid].unread
+      }
+    })
+  })
+
   sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
     if (type !== "notify") return
 
     for (const msg of msgs) {
       if (!msg.message) continue
       const jid = msg.key.remoteJid
-      if (!jid) continue
-      if (jid === "status@broadcast") continue
-      if (jid.endsWith("@g.us")) continue // ignorar grupos
+      if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) continue
 
       const m = msg.message
       const isChannel = jid.endsWith("@newsletter")
@@ -126,7 +205,6 @@ const startSock = async () => {
         if (viewOnce) {
           body = mediaType === "video" ? "🎥 Vídeo de visualização única — abra no celular" : "📷 Foto de visualização única — abra no celular"
         } else if (mediaType === "image") {
-          // tenta baixar a imagem
           try {
             const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger: console, reuploadRequest: sock.updateMediaMessage })
             imageData = "data:image/jpeg;base64," + buffer.toString("base64")
@@ -162,41 +240,28 @@ const startSock = async () => {
       messages[jid].push(entry)
       if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
 
-      const name = msg.pushName || jid.split("@")[0]
-      const contactEntry = {
-        jid,
-        name: (isChannel ? channels[jid]?.name : contacts[jid]?.name) || name,
-        lastMessage: body,
-        timestamp: msg.messageTimestamp,
-        unread: ((isChannel ? channels[jid]?.unread : contacts[jid]?.unread) || 0) + (msg.key.fromMe ? 0 : 1),
-        archived: archived.has(jid),
+      const store = isChannel ? channels : contacts
+      const name = buildName(jid, msg.pushName)
+      if (!store[jid]) {
+        store[jid] = { jid, name, lastMessage: body, timestamp: msg.messageTimestamp, unread: msg.key.fromMe ? 0 : 1, archived: archived.has(jid) }
+      } else {
+        if (!customNames[jid]) store[jid].name = name
+        store[jid].lastMessage = body
+        store[jid].timestamp = msg.messageTimestamp
+        if (!msg.key.fromMe) store[jid].unread = (store[jid].unread || 0) + 1
       }
 
-      if (isChannel) channels[jid] = contactEntry
-      else contacts[jid] = contactEntry
-
-      broadcast({ type: "message", jid, message: entry, contact: contactEntry, isChannel })
+      broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel })
     }
-  })
-
-  sock.ev.on("contacts.update", (updates) => {
-    updates.forEach(c => {
-      if (c.id && c.notify) {
-        if (contacts[c.id]) contacts[c.id].name = c.notify
-        else if (channels[c.id]) channels[c.id].name = c.notify
-      }
-    })
   })
 }
 
 // REST endpoints
-app.get("/status", (req, res) => {
-  res.json({ connected, qr: qrCode })
-})
+app.get("/status", (req, res) => res.json({ connected, qr: qrCode }))
 
 app.get("/contacts", (req, res) => {
   const list = Object.values(contacts)
-    .filter(c => !archived.has(c.jid))
+    .filter(c => !archived.has(c.jid) && c.timestamp > 0)
     .sort((a, b) => b.timestamp - a.timestamp)
   res.json(list)
 })
@@ -217,7 +282,22 @@ app.post("/archive/:jid", (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (archived.has(jid)) archived.delete(jid)
   else archived.add(jid)
+  saveData()
   res.json({ archived: archived.has(jid) })
+})
+
+app.post("/rename/:jid", (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  const { name } = req.body
+  if (!name?.trim()) {
+    delete customNames[jid]
+  } else {
+    customNames[jid] = name.trim()
+    if (contacts[jid]) contacts[jid].name = name.trim()
+    if (channels[jid]) channels[jid].name = name.trim()
+  }
+  saveData()
+  res.json({ ok: true })
 })
 
 app.get("/messages/:jid", (req, res) => {
@@ -235,7 +315,8 @@ app.post("/send", async (req, res) => {
     const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: text, timestamp: Math.floor(Date.now() / 1000) }
     if (!messages[jid]) messages[jid] = []
     messages[jid].push(entry)
-    if (contacts[jid]) { contacts[jid].lastMessage = text; contacts[jid].timestamp = entry.timestamp }
+    if (!contacts[jid]) contacts[jid] = { jid, name: buildName(jid, null), lastMessage: text, timestamp: entry.timestamp, unread: 0 }
+    else { contacts[jid].lastMessage = text; contacts[jid].timestamp = entry.timestamp }
     broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
     res.json({ ok: true })
   } catch (e) {
