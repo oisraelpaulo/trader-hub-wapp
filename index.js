@@ -1,12 +1,15 @@
-const express = require("express")
-const cors = require("cors")
-const http = require("http")
-const { WebSocketServer } = require("ws")
-const QRCode = require("qrcode")
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys")
-const { Boom } = require("@hapi/boom")
-const path = require("path")
-const fs = require("fs")
+import express from "express"
+import cors from "cors"
+import http from "http"
+import { WebSocketServer } from "ws"
+import QRCode from "qrcode"
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys"
+import { Boom } from "@hapi/boom"
+import path from "path"
+import fs from "fs"
+import { fileURLToPath } from "url"
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const app = express()
 app.use(cors())
@@ -18,10 +21,9 @@ const wss = new WebSocketServer({ server })
 let sock = null
 let qrCode = null
 let connected = false
-let messages = {} // { jid: [{ id, from, body, timestamp, fromMe }] }
-let contacts = {} // { jid: { name, jid, lastMessage, timestamp } }
+let messages = {}
+let contacts = {}
 
-// Broadcast para todos os clientes WS
 const broadcast = (data) => {
   wss.clients.forEach(client => {
     if (client.readyState === 1) client.send(JSON.stringify(data))
@@ -97,7 +99,6 @@ const startSock = async () => {
       messages[jid].push(entry)
       if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
 
-      // Atualiza contato
       const name = msg.pushName || jid.split("@")[0]
       contacts[jid] = {
         jid,
@@ -121,7 +122,6 @@ const startSock = async () => {
   })
 }
 
-// REST endpoints
 app.get("/status", (req, res) => {
   res.json({ connected, qr: qrCode })
 })
@@ -159,7 +159,6 @@ app.post("/disconnect", async (req, res) => {
   res.json({ ok: true })
 })
 
-// WebSocket
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "status", connected, qr: qrCode }))
 })
