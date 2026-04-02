@@ -80,11 +80,17 @@ const startSock = async () => {
       if (!msg.message) return
       const jid = msg.key.remoteJid
       if (jid === "status@broadcast") return
+      if (jid.endsWith("@g.us")) return // ignorar grupos
 
+      const m = msg.message
       const body =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
+        m?.conversation ||
+        m?.extendedTextMessage?.text ||
+        m?.imageMessage?.caption || (m?.imageMessage ? "📷 Imagem" : null) ||
+        (m?.videoMessage ? "🎥 Vídeo" : null) ||
+        (m?.audioMessage ? "🎵 Áudio" : null) ||
+        (m?.documentMessage ? "📄 Documento" : null) ||
+        (m?.stickerMessage ? "🎭 Sticker" : null) ||
         "[mídia]"
 
       const entry = {
