@@ -22,8 +22,8 @@ let sock = null
 let qrCode = null
 let connected = false
 let messages = {}
-let contacts = {}
-let channels = {}
+let contacts = {}   // apenas @s.whatsapp.net
+let channels = {}   // apenas @newsletter
 let customNames = {}
 let archived = new Set()
 
@@ -46,13 +46,19 @@ const broadcast = (data) => {
   wss.clients.forEach(client => { if (client.readyState === 1) client.send(JSON.stringify(data)) })
 }
 
+const isIndividual = (jid) => jid?.endsWith("@s.whatsapp.net")
+const isChannel = (jid) => jid?.endsWith("@newsletter")
+const isGroup = (jid) => jid?.endsWith("@g.us")
+const isValid = (jid) => jid && jid !== "status@broadcast" && !isGroup(jid)
+
 const getMediaType = (m) => {
-  if (m?.imageMessage) return "image"
-  if (m?.videoMessage) return "video"
-  if (m?.audioMessage) return "audio"
-  if (m?.documentMessage) return "document"
-  if (m?.stickerMessage) return "sticker"
-  if (m?.ptvMessage) return "video"
+  if (!m) return null
+  if (m.imageMessage) return "image"
+  if (m.videoMessage) return "video"
+  if (m.audioMessage) return "audio"
+  if (m.documentMessage) return "document"
+  if (m.stickerMessage) return "sticker"
+  if (m.ptvMessage) return "video"
   return null
 }
 
@@ -63,10 +69,18 @@ const isViewOnce = (m) => !!(
 
 const getBodyText = (m) => m?.conversation || m?.extendedTextMessage?.text || null
 
-const buildName = (jid, pushName) => customNames[jid] || pushName || jid.split("@")[0]
+const buildName = (jid, fallback) => {
+  if (customNames[jid]) return customNames[jid]
+  if (fallback) return fallback
+  // Formata o número de telefone como nome
+  const num = jid?.split("@")[0] || ""
+  if (/^\d+$/.test(num) && num.length >= 10) {
+    return "+" + num
+  }
+  return num
+}
 
-// Tenta baixar mídia (imagem ou sticker), retorna { imageData, mimeType } ou null
-const tryDownloadMedia = async (msg, mediaType) => {
+const tryDownload = async (msg, mediaType) => {
   try {
     const buffer = await downloadMediaMessage(msg, "buffer", {})
     if (!buffer || buffer.length === 0) return null
@@ -77,15 +91,25 @@ const tryDownloadMedia = async (msg, mediaType) => {
   }
 }
 
-// Processa uma mensagem e retorna entry + contato atualizado
-const processMsg = async (msg, download = true) => {
-  const jid = msg.key.remoteJid
-  if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return null
+const getMediaLabel = (m, mediaType) => {
+  if (mediaType === "image") return "📷 Imagem"
+  if (mediaType === "sticker") return "🎭 Sticker"
+  if (mediaType === "video") return "🎥 Vídeo"
+  if (mediaType === "audio") return "🎵 Áudio"
+  if (mediaType === "document") return `📄 ${m?.documentMessage?.fileName || "Documento"}`
+  return null
+}
+
+const processMsg = async (msg, downloadMedia = false) => {
+  const jid = msg.key?.remoteJid
+  if (!isValid(jid)) return null
 
   const m = msg.message
   if (!m) return null
 
-  const isChannel = jid.endsWith("@newsletter")
+  // Ignora mensagens stub (protocolo interno do WhatsApp)
+  if (m.protocolMessage || m.reactionMessage || m.messageContextInfo) return null
+
   const viewOnce = isViewOnce(m)
   const mediaType = getMediaType(m)
   const text = getBodyText(m)
@@ -96,52 +120,53 @@ const processMsg = async (msg, download = true) => {
   if (!body) {
     if (viewOnce) {
       body = mediaType === "video" ? "🎥 Vídeo de visualização única — abra no celular" : "📷 Foto de visualização única — abra no celular"
-    } else if (mediaType === "image" && download) {
-      imageData = await tryDownloadMedia(msg, "image")
+    } else if (mediaType === "image" && downloadMedia) {
+      imageData = await tryDownload(msg, "image")
       body = m.imageMessage?.caption || (imageData ? "" : "📷 Imagem")
-    } else if (mediaType === "sticker" && download) {
-      imageData = await tryDownloadMedia(msg, "sticker")
+    } else if (mediaType === "sticker" && downloadMedia) {
+      imageData = await tryDownload(msg, "sticker")
       body = imageData ? "" : "🎭 Sticker"
-    } else if (mediaType === "image") {
-      body = "📷 Imagem"
-    } else if (mediaType === "sticker") {
-      body = "🎭 Sticker"
-    } else if (mediaType === "video") {
-      body = "🎥 Vídeo — abra no celular para assistir"
-    } else if (mediaType === "audio") {
-      body = "🎵 Áudio"
-    } else if (mediaType === "document") {
-      body = `📄 ${m.documentMessage?.fileName || "Documento"}`
+    } else if (mediaType) {
+      body = getMediaLabel(m, mediaType)
     } else {
-      body = "[mídia]"
+      return null // sem conteúdo identificável, ignora
     }
   }
 
-  const entry = {
-    id: msg.key.id,
-    from: msg.key.fromMe ? "me" : jid,
-    fromMe: msg.key.fromMe,
-    body,
-    imageData: imageData || undefined,
-    mediaType: mediaType || undefined,
-    viewOnce,
-    timestamp: typeof msg.messageTimestamp === "object" ? Number(msg.messageTimestamp) : msg.messageTimestamp,
-  }
+  const ts = typeof msg.messageTimestamp === "object"
+    ? Number(msg.messageTimestamp)
+    : (msg.messageTimestamp || 0)
 
-  // Atualiza store
-  const store = isChannel ? channels : contacts
-  const name = buildName(jid, msg.pushName)
+  return {
+    entry: {
+      id: msg.key.id,
+      from: msg.key.fromMe ? "me" : jid,
+      fromMe: !!msg.key.fromMe,
+      body: body || "",
+      imageData: imageData || undefined,
+      mediaType: mediaType || undefined,
+      viewOnce,
+      timestamp: ts,
+    },
+    jid,
+    ts,
+    isChannel: isChannel(jid),
+    isFromMe: !!msg.key.fromMe,
+  }
+}
+
+const upsertContact = (jid, name, ts, unread, lastMessage) => {
+  const store = isChannel(jid) ? channels : contacts
   if (!store[jid]) {
-    store[jid] = { jid, name, lastMessage: body || "[mídia]", timestamp: entry.timestamp, unread: msg.key.fromMe ? 0 : 1, archived: archived.has(jid) }
+    store[jid] = { jid, name: buildName(jid, name), lastMessage: lastMessage || "", timestamp: ts || 0, unread: unread || 0, archived: archived.has(jid) }
   } else {
-    if (!customNames[jid] && name !== jid.split("@")[0]) store[jid].name = name
-    if (!body && imageData) store[jid].lastMessage = mediaType === "sticker" ? "🎭 Sticker" : "📷 Imagem"
-    else if (body) store[jid].lastMessage = body
-    store[jid].timestamp = entry.timestamp
-    if (!msg.key.fromMe) store[jid].unread = (store[jid].unread || 0) + 1
+    if (!customNames[jid] && name) store[jid].name = buildName(jid, name)
+    if (ts && ts > store[jid].timestamp) store[jid].timestamp = ts
+    if (lastMessage) store[jid].lastMessage = lastMessage
+    if (unread) store[jid].unread = (store[jid].unread || 0) + unread
+    store[jid].archived = archived.has(jid)
   }
-
-  return { entry, jid, isChannel }
+  return (isChannel(jid) ? channels : contacts)[jid]
 }
 
 const startSock = async () => {
@@ -155,7 +180,6 @@ const startSock = async () => {
     auth: state,
     browser: ["TraderHub", "Chrome", "1.0.0"],
     syncFullHistory: false,
-    getMessage: async () => ({ conversation: "" }),
   })
 
   sock.ev.on("creds.update", saveCreds)
@@ -189,16 +213,17 @@ const startSock = async () => {
     }
   })
 
+  // Nomes dos contatos salvos no celular
   sock.ev.on("contacts.upsert", (list) => {
     list.forEach(c => {
-      if (!c.id) return
-      const name = buildName(c.id, c.name || c.notify || c.verifiedName)
-      if (c.id.endsWith("@s.whatsapp.net")) {
-        if (!contacts[c.id]) contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: archived.has(c.id) }
-        else if (!customNames[c.id]) contacts[c.id].name = name
-      } else if (c.id.endsWith("@newsletter")) {
-        if (!channels[c.id]) channels[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0 }
-        else if (!customNames[c.id]) channels[c.id].name = name
+      if (!c.id || isGroup(c.id)) return
+      const name = c.name || c.notify || c.verifiedName || null
+      if (isIndividual(c.id)) {
+        if (!contacts[c.id]) contacts[c.id] = { jid: c.id, name: buildName(c.id, name), lastMessage: "", timestamp: 0, unread: 0, archived: archived.has(c.id) }
+        else if (!customNames[c.id] && name) contacts[c.id].name = buildName(c.id, name)
+      } else if (isChannel(c.id)) {
+        if (!channels[c.id]) channels[c.id] = { jid: c.id, name: buildName(c.id, name), lastMessage: "", timestamp: 0, unread: 0 }
+        else if (!customNames[c.id] && name) channels[c.id].name = buildName(c.id, name)
       }
     })
     broadcast({ type: "contacts_updated" })
@@ -206,7 +231,7 @@ const startSock = async () => {
 
   sock.ev.on("contacts.update", (updates) => {
     updates.forEach(c => {
-      if (!c.id || customNames[c.id]) return
+      if (!c.id || customNames[c.id] || isGroup(c.id)) return
       const name = c.notify || c.name
       if (!name) return
       if (contacts[c.id]) contacts[c.id].name = name
@@ -214,53 +239,52 @@ const startSock = async () => {
     })
   })
 
+  // Chats existentes (lista de conversas)
   sock.ev.on("chats.upsert", (list) => {
     list.forEach(chat => {
       const jid = chat.id
-      if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return
-      const isChannel = jid.endsWith("@newsletter")
-      let rawName = chat.name || chat.displayName || null
-      if (isChannel && rawName && /^\d+$/.test(rawName.replace(/[^a-zA-Z0-9]/g, ""))) rawName = null
-      const name = customNames[jid] || rawName || jid.split("@")[0]
-      const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
-      const store = isChannel ? channels : contacts
-      if (!store[jid]) {
-        store[jid] = { jid, name, lastMessage: "", timestamp: ts, unread: chat.unreadCount || 0, archived: archived.has(jid) }
-      } else {
-        if (!customNames[jid] && rawName) store[jid].name = rawName
-        if (ts > store[jid].timestamp) store[jid].timestamp = ts
-        if (chat.unreadCount) store[jid].unread = chat.unreadCount
-      }
+      if (!isValid(jid)) return
+      // Garante separação correta
+      if (!isIndividual(jid) && !isChannel(jid)) return
+
+      const rawName = chat.name || chat.displayName || null
+      const ts = typeof chat.conversationTimestamp === "object"
+        ? Number(chat.conversationTimestamp)
+        : (chat.conversationTimestamp || 0)
+      upsertContact(jid, rawName, ts, chat.unreadCount || 0, null)
     })
     broadcast({ type: "chats_loaded" })
   })
 
+  // Nome real de canais
   sock.ev.on("newsletter.upsert", (list) => {
     list?.forEach((n) => {
       const jid = n.id
       if (!jid) return
-      const name = customNames[jid] || n.name || n.metadata?.name || n.metadata?.title || jid.split("@")[0]
-      if (!channels[jid]) channels[jid] = { jid, name, lastMessage: "", timestamp: 0, unread: 0 }
-      else if (!customNames[jid]) channels[jid].name = name
+      const name = n.name || n.metadata?.name || n.metadata?.title || null
+      if (!channels[jid]) channels[jid] = { jid, name: buildName(jid, name), lastMessage: "", timestamp: 0, unread: 0 }
+      else if (!customNames[jid] && name) channels[jid].name = name
     })
     broadcast({ type: "contacts_updated" })
   })
 
-  // Histórico de mensagens existentes (sync inicial)
+  // Histórico de mensagens (sync inicial — sem download de mídia)
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
-    console.log(`Carregando histórico: ${msgs.length} mensagens`)
+    console.log(`Histórico: ${msgs.length} msgs`)
     for (const msg of msgs) {
-      if (!msg.message) continue
-      const jid = msg.key.remoteJid
-      if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) continue
-      // Histórico: não baixa mídia, só texto
       const result = await processMsg(msg, false)
       if (!result) continue
+      const { entry, jid, ts, isFromMe } = result
       if (!messages[jid]) messages[jid] = []
-      // Evita duplicatas
-      if (!messages[jid].find(e => e.id === result.entry.id)) {
-        messages[jid].unshift(result.entry)
-        if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
+      if (!messages[jid].find(e => e.id === entry.id)) {
+        messages[jid].push(entry)
+        if (messages[jid].length > 100) messages[jid] = messages[jid].slice(0, 100)
+      }
+      // Atualiza última mensagem do contato se for mais recente
+      const store = isChannel(jid) ? channels : contacts
+      if (store[jid] && ts > (store[jid].timestamp || 0)) {
+        store[jid].lastMessage = entry.body || store[jid].lastMessage
+        store[jid].timestamp = ts
       }
     }
     broadcast({ type: "chats_loaded" })
@@ -270,16 +294,17 @@ const startSock = async () => {
   sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
     if (type !== "notify") return
     for (const msg of msgs) {
-      const result = await processMsg(msg, true) // baixa mídia
+      const result = await processMsg(msg, true)
       if (!result) continue
-      const { entry, jid, isChannel } = result
+      const { entry, jid, isChannel: isCh, isFromMe } = result
       if (!messages[jid]) messages[jid] = []
       if (!messages[jid].find(e => e.id === entry.id)) {
         messages[jid].push(entry)
         if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
       }
-      const store = isChannel ? channels : contacts
-      broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel })
+      const store = isCh ? channels : contacts
+      upsertContact(jid, msg.pushName, entry.timestamp, isFromMe ? 0 : 1, entry.body || (entry.imageData ? (entry.mediaType === "sticker" ? "🎭 Sticker" : "📷 Imagem") : null))
+      broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel: isCh })
     }
   })
 }
@@ -289,13 +314,15 @@ app.get("/status", (req, res) => res.json({ connected, qr: qrCode }))
 
 app.get("/contacts", (req, res) => {
   const list = Object.values(contacts)
-    .filter(c => !archived.has(c.jid) && c.timestamp > 0 && c.jid.endsWith("@s.whatsapp.net"))
+    .filter(c => isIndividual(c.jid) && !archived.has(c.jid) && c.timestamp > 0)
     .sort((a, b) => b.timestamp - a.timestamp)
   res.json(list)
 })
 
 app.get("/channels", (req, res) => {
-  const list = Object.values(channels).sort((a, b) => b.timestamp - a.timestamp)
+  const list = Object.values(channels)
+    .filter(c => isChannel(c.jid))
+    .sort((a, b) => b.timestamp - a.timestamp)
   res.json(list)
 })
 
@@ -332,7 +359,19 @@ app.get("/messages/:jid", (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (contacts[jid]) contacts[jid].unread = 0
   if (channels[jid]) channels[jid].unread = 0
-  res.json(messages[jid] || [])
+  res.json((messages[jid] || []).slice(-100))
+})
+
+// Foto de perfil (buscada sob demanda)
+app.get("/profile-pic/:jid", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  if (!sock || !connected) return res.json({ url: null })
+  try {
+    const url = await sock.profilePictureUrl(jid, "image")
+    res.json({ url: url || null })
+  } catch {
+    res.json({ url: null })
+  }
 })
 
 app.post("/send", async (req, res) => {
@@ -343,8 +382,7 @@ app.post("/send", async (req, res) => {
     const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: text, timestamp: Math.floor(Date.now() / 1000) }
     if (!messages[jid]) messages[jid] = []
     messages[jid].push(entry)
-    if (!contacts[jid]) contacts[jid] = { jid, name: buildName(jid, null), lastMessage: text, timestamp: entry.timestamp, unread: 0, archived: false }
-    else { contacts[jid].lastMessage = text; contacts[jid].timestamp = entry.timestamp }
+    upsertContact(jid, null, entry.timestamp, 0, text)
     broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
     res.json({ ok: true })
   } catch (e) {
