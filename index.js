@@ -172,16 +172,33 @@ const startSock = async () => {
       if (!jid) return
       if (jid === "status@broadcast" || jid.endsWith("@g.us")) return
       const isChannel = jid.endsWith("@newsletter")
-      const name = buildName(jid, chat.name)
+
+      // Ignora canais sem nome real (jid codificado) — serão preenchidos via newsletter.upsert
+      let rawName = chat.name || chat.displayName || null
+      if (isChannel && (!rawName || rawName === jid.split("@")[0])) rawName = null
+
+      const name = customNames[jid] || rawName || jid.split("@")[0]
       const store = isChannel ? channels : contacts
       if (!store[jid]) {
         store[jid] = { jid, name, lastMessage: "", timestamp: chat.conversationTimestamp || 0, unread: chat.unreadCount || 0, archived: archived.has(jid) }
       } else {
-        if (!customNames[jid]) store[jid].name = name
+        if (!customNames[jid] && rawName) store[jid].name = rawName
         store[jid].timestamp = chat.conversationTimestamp || store[jid].timestamp
         store[jid].unread = chat.unreadCount || store[jid].unread
       }
     })
+  })
+
+  // Canais — evento específico do Baileys com nome real
+  sock.ev.on("newsletter.upsert", (list) => {
+    list?.forEach((n) => {
+      const jid = n.id
+      if (!jid) return
+      const name = customNames[jid] || n.name || n.metadata?.name || jid.split("@")[0]
+      if (!channels[jid]) channels[jid] = { jid, name, lastMessage: "", timestamp: 0, unread: 0 }
+      else channels[jid].name = name
+    })
+    broadcast({ type: "contacts_updated" })
   })
 
   sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
@@ -261,7 +278,7 @@ app.get("/status", (req, res) => res.json({ connected, qr: qrCode }))
 
 app.get("/contacts", (req, res) => {
   const list = Object.values(contacts)
-    .filter(c => !archived.has(c.jid) && c.timestamp > 0)
+    .filter(c => !archived.has(c.jid) && c.timestamp > 0 && !c.jid.endsWith("@newsletter"))
     .sort((a, b) => b.timestamp - a.timestamp)
   res.json(list)
 })
