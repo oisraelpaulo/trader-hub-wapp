@@ -3,7 +3,7 @@ import cors from "cors"
 import http from "http"
 import { WebSocketServer } from "ws"
 import QRCode from "qrcode"
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys"
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from "@whiskeysockets/baileys"
 import { Boom } from "@hapi/boom"
 import path from "path"
 import fs from "fs"
@@ -21,13 +21,43 @@ const wss = new WebSocketServer({ server })
 let sock = null
 let qrCode = null
 let connected = false
-let messages = {}
-let contacts = {}
+let messages = {}   // { jid: [entry] }
+let contacts = {}   // { jid: contact }  — only @s.whatsapp.net (individual)
+let channels = {}   // { jid: contact }  — @newsletter
+let archived = new Set() // jids arquivados manualmente
 
 const broadcast = (data) => {
   wss.clients.forEach(client => {
     if (client.readyState === 1) client.send(JSON.stringify(data))
   })
+}
+
+const getMediaType = (m) => {
+  if (m?.imageMessage) return "image"
+  if (m?.videoMessage) return "video"
+  if (m?.audioMessage) return "audio"
+  if (m?.documentMessage) return "document"
+  if (m?.stickerMessage) return "sticker"
+  if (m?.ptvMessage) return "video" // video note
+  return null
+}
+
+const isViewOnce = (m) => {
+  return !!(
+    m?.imageMessage?.viewOnce ||
+    m?.videoMessage?.viewOnce ||
+    m?.viewOnceMessage ||
+    m?.viewOnceMessageV2 ||
+    m?.viewOnceMessageV2Extension
+  )
+}
+
+const getBodyText = (m) => {
+  return (
+    m?.conversation ||
+    m?.extendedTextMessage?.text ||
+    null
+  )
 }
 
 const startSock = async () => {
@@ -39,7 +69,6 @@ const startSock = async () => {
   sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: true,
     browser: ["TraderHub", "Chrome", "1.0.0"],
   })
 
@@ -74,30 +103,58 @@ const startSock = async () => {
     }
   })
 
-  sock.ev.on("messages.upsert", ({ messages: msgs, type }) => {
+  sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
     if (type !== "notify") return
-    msgs.forEach(msg => {
-      if (!msg.message) return
+
+    for (const msg of msgs) {
+      if (!msg.message) continue
       const jid = msg.key.remoteJid
-      if (jid === "status@broadcast") return
-      if (jid.endsWith("@g.us")) return // ignorar grupos
+      if (!jid) continue
+      if (jid === "status@broadcast") continue
+      if (jid.endsWith("@g.us")) continue // ignorar grupos
 
       const m = msg.message
-      const body =
-        m?.conversation ||
-        m?.extendedTextMessage?.text ||
-        m?.imageMessage?.caption || (m?.imageMessage ? "📷 Imagem" : null) ||
-        (m?.videoMessage ? "🎥 Vídeo" : null) ||
-        (m?.audioMessage ? "🎵 Áudio" : null) ||
-        (m?.documentMessage ? "📄 Documento" : null) ||
-        (m?.stickerMessage ? "🎭 Sticker" : null) ||
-        "[mídia]"
+      const isChannel = jid.endsWith("@newsletter")
+      const viewOnce = isViewOnce(m)
+      const mediaType = getMediaType(m)
+      const text = getBodyText(m)
+
+      let body = text
+      let imageData = null
+
+      if (!body) {
+        if (viewOnce) {
+          body = mediaType === "video" ? "🎥 Vídeo de visualização única — abra no celular" : "📷 Foto de visualização única — abra no celular"
+        } else if (mediaType === "image") {
+          // tenta baixar a imagem
+          try {
+            const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger: console, reuploadRequest: sock.updateMediaMessage })
+            imageData = "data:image/jpeg;base64," + buffer.toString("base64")
+            body = m.imageMessage?.caption || ""
+          } catch {
+            body = "📷 Imagem"
+          }
+        } else if (mediaType === "video") {
+          body = "🎥 Vídeo — abra no celular para assistir"
+        } else if (mediaType === "audio") {
+          body = "🎵 Áudio"
+        } else if (mediaType === "document") {
+          body = `📄 ${m.documentMessage?.fileName || "Documento"}`
+        } else if (mediaType === "sticker") {
+          body = "🎭 Sticker"
+        } else {
+          body = "[mídia]"
+        }
+      }
 
       const entry = {
         id: msg.key.id,
         from: msg.key.fromMe ? "me" : jid,
         fromMe: msg.key.fromMe,
         body,
+        imageData: imageData || undefined,
+        mediaType: mediaType || undefined,
+        viewOnce,
         timestamp: msg.messageTimestamp,
       }
 
@@ -106,40 +163,67 @@ const startSock = async () => {
       if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
 
       const name = msg.pushName || jid.split("@")[0]
-      contacts[jid] = {
+      const contactEntry = {
         jid,
-        name: contacts[jid]?.name || name,
+        name: (isChannel ? channels[jid]?.name : contacts[jid]?.name) || name,
         lastMessage: body,
         timestamp: msg.messageTimestamp,
-        unread: (contacts[jid]?.unread || 0) + (msg.key.fromMe ? 0 : 1),
+        unread: ((isChannel ? channels[jid]?.unread : contacts[jid]?.unread) || 0) + (msg.key.fromMe ? 0 : 1),
+        archived: archived.has(jid),
       }
 
-      broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
-    })
+      if (isChannel) channels[jid] = contactEntry
+      else contacts[jid] = contactEntry
+
+      broadcast({ type: "message", jid, message: entry, contact: contactEntry, isChannel })
+    }
   })
 
   sock.ev.on("contacts.update", (updates) => {
     updates.forEach(c => {
       if (c.id && c.notify) {
         if (contacts[c.id]) contacts[c.id].name = c.notify
-        else contacts[c.id] = { jid: c.id, name: c.notify, lastMessage: "", timestamp: 0, unread: 0 }
+        else if (channels[c.id]) channels[c.id].name = c.notify
       }
     })
   })
 }
 
+// REST endpoints
 app.get("/status", (req, res) => {
   res.json({ connected, qr: qrCode })
 })
 
 app.get("/contacts", (req, res) => {
-  const list = Object.values(contacts).sort((a, b) => b.timestamp - a.timestamp)
+  const list = Object.values(contacts)
+    .filter(c => !archived.has(c.jid))
+    .sort((a, b) => b.timestamp - a.timestamp)
   res.json(list)
+})
+
+app.get("/channels", (req, res) => {
+  const list = Object.values(channels).sort((a, b) => b.timestamp - a.timestamp)
+  res.json(list)
+})
+
+app.get("/archived", (req, res) => {
+  const list = Object.values(contacts)
+    .filter(c => archived.has(c.jid))
+    .sort((a, b) => b.timestamp - a.timestamp)
+  res.json(list)
+})
+
+app.post("/archive/:jid", (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  if (archived.has(jid)) archived.delete(jid)
+  else archived.add(jid)
+  res.json({ archived: archived.has(jid) })
 })
 
 app.get("/messages/:jid", (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (contacts[jid]) contacts[jid].unread = 0
+  if (channels[jid]) channels[jid].unread = 0
   res.json(messages[jid] || [])
 })
 
