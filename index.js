@@ -22,24 +22,49 @@ let sock = null
 let qrCode = null
 let connected = false
 let messages = {}
-let contacts = {}   // apenas @s.whatsapp.net
-let channels = {}   // apenas @newsletter
-let customNames = {}
+let contacts = {}      // apenas @s.whatsapp.net
+let channels = {}      // apenas @newsletter
+let customNames = {}   // nomes personalizados pelo usuário
+let phoneBookNames = {} // nomes vindos da agenda do celular (prioridade sobre pushName)
 let archived = new Set()
 
 const DATA_FILE = path.join(__dirname, "data.json")
+const CONTACTS_FILE = path.join(__dirname, "contacts_cache.json")
+
 const loadData = () => {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))
       customNames = d.customNames || {}
       archived = new Set(d.archived || [])
+      phoneBookNames = d.phoneBookNames || {}
+    }
+  } catch {}
+  // Carrega cache de contatos/canais salvos
+  try {
+    if (fs.existsSync(CONTACTS_FILE)) {
+      const d = JSON.parse(fs.readFileSync(CONTACTS_FILE, "utf8"))
+      contacts = d.contacts || {}
+      channels = d.channels || {}
     }
   } catch {}
 }
+
 const saveData = () => {
-  try { fs.writeFileSync(DATA_FILE, JSON.stringify({ customNames, archived: [...archived] })) } catch {}
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify({ customNames, archived: [...archived], phoneBookNames })) } catch {}
 }
+
+const saveContactsCache = () => {
+  try {
+    // Salva sem imageData para não explodir o arquivo
+    const c = {}
+    const ch = {}
+    Object.entries(contacts).forEach(([k, v]) => { c[k] = { ...v } })
+    Object.entries(channels).forEach(([k, v]) => { ch[k] = { ...v } })
+    fs.writeFileSync(CONTACTS_FILE, JSON.stringify({ contacts: c, channels: ch }))
+  } catch {}
+}
+
 loadData()
 
 const broadcast = (data) => {
@@ -69,15 +94,12 @@ const isViewOnce = (m) => !!(
 
 const getBodyText = (m) => m?.conversation || m?.extendedTextMessage?.text || null
 
-const buildName = (jid, fallback) => {
+const buildName = (jid, pushName) => {
   if (customNames[jid]) return customNames[jid]
-  if (fallback) return fallback
-  // Formata o número de telefone como nome
+  if (phoneBookNames[jid]) return phoneBookNames[jid] // agenda do celular
+  if (pushName) return pushName // nome que a pessoa colocou no próprio WhatsApp
   const num = jid?.split("@")[0] || ""
-  if (/^\d+$/.test(num) && num.length >= 10) {
-    return "+" + num
-  }
-  return num
+  return (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
 }
 
 const tryDownload = async (msg, mediaType) => {
@@ -213,30 +235,37 @@ const startSock = async () => {
     }
   })
 
-  // Nomes dos contatos salvos no celular
+  // Nomes dos contatos salvos na agenda do celular (maior prioridade)
   sock.ev.on("contacts.upsert", (list) => {
     list.forEach(c => {
       if (!c.id || isGroup(c.id)) return
       const name = c.name || c.notify || c.verifiedName || null
+      if (name) phoneBookNames[c.id] = name // salva na agenda
+      const resolvedName = buildName(c.id, name)
       if (isIndividual(c.id)) {
-        if (!contacts[c.id]) contacts[c.id] = { jid: c.id, name: buildName(c.id, name), lastMessage: "", timestamp: 0, unread: 0, archived: archived.has(c.id) }
-        else if (!customNames[c.id] && name) contacts[c.id].name = buildName(c.id, name)
+        if (!contacts[c.id]) contacts[c.id] = { jid: c.id, name: resolvedName, lastMessage: "", timestamp: 0, unread: 0, archived: archived.has(c.id) }
+        else contacts[c.id].name = resolvedName
       } else if (isChannel(c.id)) {
-        if (!channels[c.id]) channels[c.id] = { jid: c.id, name: buildName(c.id, name), lastMessage: "", timestamp: 0, unread: 0 }
-        else if (!customNames[c.id] && name) channels[c.id].name = buildName(c.id, name)
+        if (!channels[c.id]) channels[c.id] = { jid: c.id, name: resolvedName, lastMessage: "", timestamp: 0, unread: 0 }
+        else channels[c.id].name = resolvedName
       }
     })
+    saveData()
+    saveContactsCache()
     broadcast({ type: "contacts_updated" })
   })
 
   sock.ev.on("contacts.update", (updates) => {
     updates.forEach(c => {
-      if (!c.id || customNames[c.id] || isGroup(c.id)) return
+      if (!c.id || isGroup(c.id)) return
       const name = c.notify || c.name
       if (!name) return
-      if (contacts[c.id]) contacts[c.id].name = name
-      else if (channels[c.id]) channels[c.id].name = name
+      if (!customNames[c.id]) phoneBookNames[c.id] = name
+      const resolvedName = buildName(c.id, name)
+      if (contacts[c.id]) contacts[c.id].name = resolvedName
+      else if (channels[c.id]) channels[c.id].name = resolvedName
     })
+    saveData()
   })
 
   // Chats existentes (lista de conversas)
@@ -253,6 +282,7 @@ const startSock = async () => {
         : (chat.conversationTimestamp || 0)
       upsertContact(jid, rawName, ts, chat.unreadCount || 0, null)
     })
+    saveContactsCache()
     broadcast({ type: "chats_loaded" })
   })
 
@@ -303,7 +333,10 @@ const startSock = async () => {
         if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
       }
       const store = isCh ? channels : contacts
-      upsertContact(jid, msg.pushName, entry.timestamp, isFromMe ? 0 : 1, entry.body || (entry.imageData ? (entry.mediaType === "sticker" ? "🎭 Sticker" : "📷 Imagem") : null))
+      // pushName só usado se não tiver nome na agenda
+      const msgName = phoneBookNames[jid] ? null : msg.pushName
+      upsertContact(jid, msgName, entry.timestamp, isFromMe ? 0 : 1, entry.body || (entry.imageData ? (entry.mediaType === "sticker" ? "🎭 Sticker" : "📷 Imagem") : null))
+      saveContactsCache()
       broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel: isCh })
     }
   })
