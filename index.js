@@ -72,15 +72,19 @@ const dbLoad = async () => {
     const { data } = await supabase.from("wapp_contacts").select("*")
     if (!data) return
     data.forEach(row => {
+      // Prioridade: custom_name > phone_book_name > name salvo > número formatado
+      const num = row.jid.split("@")[0]
+      const formattedNum = (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
+      const resolvedName = row.custom_name || row.phone_book_name || (row.name !== formattedNum ? row.name : null) || formattedNum
       const entry = {
         jid: row.jid,
-        name: row.custom_name || row.phone_book_name || row.name || row.jid.split("@")[0],
+        name: resolvedName,
         lastMessage: row.last_message || "",
         timestamp: row.timestamp || 0,
         unread: row.unread || 0,
         archived: row.archived || false,
-        phone_book_name: row.phone_book_name,
-        custom_name: row.custom_name,
+        phone_book_name: row.phone_book_name || null,
+        custom_name: row.custom_name || null,
       }
       if (row.is_channel) channels[row.jid] = entry
       else contacts[row.jid] = entry
@@ -109,9 +113,15 @@ const MIME_MAP = {
 
 const tryDownload = async (msg, mediaType) => {
   try {
-    const buffer = await downloadMediaMessage(msg, "buffer", {})
+    const buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger: { level: () => {}, trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => ({}) }, reuploadRequest: sock?.updateMediaMessage }
+    )
     if (!buffer || buffer.length === 0) return null
     const mime = MIME_MAP[mediaType] || "application/octet-stream"
+    console.log(`Downloaded ${mediaType}: ${buffer.length} bytes`)
     return `data:${mime};base64,${buffer.toString("base64")}`
   } catch (e) {
     console.error(`tryDownload(${mediaType}) failed:`, e.message)
@@ -232,10 +242,14 @@ const startSock = async () => {
       if (!name) continue
       const isCh = isChannelJid(c.id)
       const store = isCh ? channels : contacts
-      if (!store[c.id]) store[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false }
-      store[c.id].phone_book_name = name
-      store[c.id].name = store[c.id].custom_name || name
-      await dbUpsert(c.id, { name: store[c.id].name, phone_book_name: name, is_channel: isCh, last_message: store[c.id].lastMessage, timestamp: store[c.id].timestamp, unread: store[c.id].unread, archived: store[c.id].archived || false })
+      if (!store[c.id]) {
+        store[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name }
+      } else {
+        store[c.id].phone_book_name = name
+        // Nome da agenda sempre vence sobre qualquer coisa exceto custom_name
+        if (!store[c.id].custom_name) store[c.id].name = name
+      }
+      await dbUpsert(c.id, { name: store[c.id].name, phone_book_name: name, is_channel: isCh, last_message: store[c.id].lastMessage || "", timestamp: store[c.id].timestamp || 0, unread: store[c.id].unread || 0, archived: store[c.id].archived || false })
     }
     broadcast({ type: "contacts_updated" })
   })
