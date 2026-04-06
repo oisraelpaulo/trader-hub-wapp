@@ -73,6 +73,7 @@ let sock = null
 let qrCode = null
 let connected = false
 let reconnecting = false
+let reconnectDelay = 3000
 let messages = {}
 let contacts = {}
 
@@ -295,7 +296,7 @@ const startSock = async () => {
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) { qrCode = await QRCode.toDataURL(qr); connected = false; broadcast({ type: "qr", qr: qrCode }) }
     if (connection === "open") {
-      qrCode = null; connected = true
+      qrCode = null; connected = true; reconnectDelay = 3000
       broadcast({ type: "connected" })
       console.log("WhatsApp conectado!")
     }
@@ -307,10 +308,11 @@ const startSock = async () => {
       if (shouldReconnect) {
         if (!reconnecting) {
           reconnecting = true
-          console.log("Reconectando...")
-          setTimeout(() => { reconnecting = false; startSock() }, 3000)
+          console.log(`Reconectando em ${reconnectDelay / 1000}s...`)
+          setTimeout(() => { reconnecting = false; reconnectDelay = Math.min(reconnectDelay * 1.5, 30000); startSock() }, reconnectDelay)
         }
       } else {
+        reconnectDelay = 3000
         console.log("Deslogado. Limpando auth...")
         if (supabase) {
           try { await supabase.from("wapp_auth").delete().neq("key", "__none__") } catch {}
@@ -506,6 +508,12 @@ app.post("/disconnect", async (req, res) => {
 
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "status", connected, qr: qrCode }))
+  // Se já conectado com contatos, avisa o cliente para carregar a lista imediatamente
+  if (connected && Object.keys(contacts).length > 0) {
+    setTimeout(() => {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: "chats_loaded" }))
+    }, 300)
+  }
 })
 
 const PORT = process.env.PORT || 3001
