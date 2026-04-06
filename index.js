@@ -16,7 +16,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_KEY
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null
 
-// Auth state persistido no Supabase (sobrevive redeploys)
 const useSupabaseAuthState = async () => {
   const get = async (key) => {
     if (!supabase) return null
@@ -76,16 +75,14 @@ let connected = false
 let reconnecting = false
 let messages = {}
 let contacts = {}
-let channels = {}
 
 const broadcast = (data) => {
   wss.clients.forEach(client => { if (client.readyState === 1) client.send(JSON.stringify(data)) })
 }
 
 const isIndividual = (jid) => jid?.endsWith("@s.whatsapp.net")
-const isChannelJid = (jid) => jid?.endsWith("@newsletter")
 const isGroup = (jid) => jid?.endsWith("@g.us")
-const isValid = (jid) => jid && jid !== "status@broadcast" && !isGroup(jid)
+const isValid = (jid) => jid && isIndividual(jid)
 
 const getMediaType = (m) => {
   if (!m) return null
@@ -113,18 +110,17 @@ const buildName = (jid, contact, pushName) => {
   return (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
 }
 
-// Supabase helpers
 const dbLoad = async () => {
   if (!supabase) return
   try {
-    const { data } = await supabase.from("wapp_contacts").select("*")
+    const { data } = await supabase.from("wapp_contacts").select("*").eq("is_channel", false)
     if (!data) return
     data.forEach(row => {
-      // Prioridade: custom_name > phone_book_name > name salvo > número formatado
+      if (!isIndividual(row.jid)) return
       const num = row.jid.split("@")[0]
       const formattedNum = (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
       const resolvedName = row.custom_name || row.phone_book_name || (row.name !== formattedNum ? row.name : null) || formattedNum
-      const entry = {
+      contacts[row.jid] = {
         jid: row.jid,
         name: resolvedName,
         lastMessage: row.last_message || "",
@@ -134,8 +130,6 @@ const dbLoad = async () => {
         phone_book_name: row.phone_book_name || null,
         custom_name: row.custom_name || null,
       }
-      if (row.is_channel) channels[row.jid] = entry
-      else contacts[row.jid] = entry
     })
     console.log(`Carregados ${data.length} contatos do Supabase`)
   } catch (e) {
@@ -162,13 +156,11 @@ const MIME_MAP = {
 const silentLogger = { level: () => {}, trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => ({}) }
 
 const tryDownload = async (msg, mediaType) => {
-  // Verifica se mediaKey existe — sem ela é impossível descriptografar
   const fieldMap = { image: "imageMessage", sticker: "stickerMessage", audio: "audioMessage", video: "videoMessage" }
   const mediaObj = msg.message?.[fieldMap[mediaType]]
   if (!mediaObj) return null
 
   let msgToUse = msg
-  // Se mediaKey ausente/vazio, tenta atualizar o msg via WA para obter chaves frescas
   if (!mediaObj.mediaKey || mediaObj.mediaKey.length === 0) {
     try {
       const refreshed = await Promise.race([
@@ -244,17 +236,16 @@ const processMsg = async (msg, downloadMedia = false) => {
 
   return {
     entry: { id: msg.key.id, from: fromMe ? "me" : jid, fromMe, body: body || "", mediaData: mediaData || undefined, mediaType: mediaType || undefined, viewOnce, timestamp: ts },
-    jid, ts, isCh: isChannelJid(jid), fromMe,
+    jid, ts, fromMe,
   }
 }
 
-const upsertContact = async (jid, pushName, ts, unread, lastMessage, isCh = false) => {
-  const store = isCh ? channels : contacts
-  const existing = store[jid]
+const upsertContact = async (jid, pushName, ts, unread, lastMessage) => {
+  const existing = contacts[jid]
   const name = buildName(jid, existing, pushName)
 
   if (!existing) {
-    store[jid] = { jid, name, lastMessage: lastMessage || "", timestamp: ts || 0, unread: unread || 0, archived: false }
+    contacts[jid] = { jid, name, lastMessage: lastMessage || "", timestamp: ts || 0, unread: unread || 0, archived: false }
   } else {
     if (!existing.custom_name && !existing.phone_book_name && pushName) existing.name = pushName
     if (ts && ts > existing.timestamp) existing.timestamp = ts
@@ -263,19 +254,18 @@ const upsertContact = async (jid, pushName, ts, unread, lastMessage, isCh = fals
   }
 
   await dbUpsert(jid, {
-    name: store[jid].name,
-    last_message: store[jid].lastMessage,
-    timestamp: store[jid].timestamp,
-    unread: store[jid].unread,
-    archived: store[jid].archived || false,
-    is_channel: isCh,
+    name: contacts[jid].name,
+    last_message: contacts[jid].lastMessage,
+    timestamp: contacts[jid].timestamp,
+    unread: contacts[jid].unread,
+    archived: contacts[jid].archived || false,
+    is_channel: false,
   })
 
-  return store[jid]
+  return contacts[jid]
 }
 
 const startSock = async () => {
-  // Usa Supabase para auth se disponível, senão fallback para arquivo
   let state, saveCreds
   if (supabase) {
     const auth = await useSupabaseAuthState()
@@ -308,21 +298,6 @@ const startSock = async () => {
       qrCode = null; connected = true
       broadcast({ type: "connected" })
       console.log("WhatsApp conectado!")
-      // Busca metadados dos canais sem nome
-      setTimeout(async () => {
-        const unnamed = Object.values(channels).filter(c => !c.name || c.name === c.jid.split("@")[0])
-        for (const ch of unnamed.slice(0, 20)) {
-          try {
-            const meta = await sock.getNewsletterInfo(ch.jid)
-            const name = meta?.name || meta?.metadata?.name || null
-            if (name) {
-              channels[ch.jid].name = name
-              await dbUpsert(ch.jid, { name, is_channel: true })
-            }
-          } catch {}
-        }
-        if (unnamed.length > 0) broadcast({ type: "contacts_updated" })
-      }, 5000)
     }
     if (connection === "close") {
       connected = false
@@ -349,60 +324,40 @@ const startSock = async () => {
 
   sock.ev.on("contacts.upsert", async (list) => {
     for (const c of list) {
-      if (!c.id || isGroup(c.id)) continue
+      if (!c.id || !isIndividual(c.id)) continue
       const name = c.name || c.notify || c.verifiedName || null
       if (!name) continue
-      const isCh = isChannelJid(c.id)
-      const store = isCh ? channels : contacts
-      if (!store[c.id]) {
-        store[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name }
+      if (!contacts[c.id]) {
+        contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name }
       } else {
-        store[c.id].phone_book_name = name
-        // Nome da agenda sempre vence sobre qualquer coisa exceto custom_name
-        if (!store[c.id].custom_name) store[c.id].name = name
+        contacts[c.id].phone_book_name = name
+        if (!contacts[c.id].custom_name) contacts[c.id].name = name
       }
-      await dbUpsert(c.id, { name: store[c.id].name, phone_book_name: name, is_channel: isCh, last_message: store[c.id].lastMessage || "", timestamp: store[c.id].timestamp || 0, unread: store[c.id].unread || 0, archived: store[c.id].archived || false })
+      await dbUpsert(c.id, { name: contacts[c.id].name, phone_book_name: name, is_channel: false, last_message: contacts[c.id].lastMessage || "", timestamp: contacts[c.id].timestamp || 0, unread: contacts[c.id].unread || 0, archived: contacts[c.id].archived || false })
     }
     broadcast({ type: "contacts_updated" })
   })
 
   sock.ev.on("contacts.update", async (updates) => {
     for (const c of updates) {
-      if (!c.id || isGroup(c.id)) continue
+      if (!c.id || !isIndividual(c.id)) continue
       const name = c.notify || c.name
-      if (!name) continue
-      const store = contacts[c.id] ? contacts : channels[c.id] ? channels : null
-      if (!store) continue
-      store[c.id].phone_book_name = name
-      if (!store[c.id].custom_name) store[c.id].name = name
-      await dbUpsert(c.id, { phone_book_name: name, name: store[c.id].name })
+      if (!name || !contacts[c.id]) continue
+      contacts[c.id].phone_book_name = name
+      if (!contacts[c.id].custom_name) contacts[c.id].name = name
+      await dbUpsert(c.id, { phone_book_name: name, name: contacts[c.id].name })
     }
   })
 
   sock.ev.on("chats.upsert", async (list) => {
     for (const chat of list) {
       const jid = chat.id
-      if (!isValid(jid) || (!isIndividual(jid) && !isChannelJid(jid))) continue
-      const isCh = isChannelJid(jid)
+      if (!isIndividual(jid)) continue
       const rawName = chat.name || chat.displayName || null
       const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
-      await upsertContact(jid, rawName, ts, chat.unreadCount || 0, null, isCh)
+      await upsertContact(jid, rawName, ts, chat.unreadCount || 0, null)
     }
     broadcast({ type: "chats_loaded" })
-  })
-
-  sock.ev.on("newsletter.upsert", async (list) => {
-    for (const n of (list || [])) {
-      const jid = n.id
-      if (!jid) continue
-      const name = n.name || n.metadata?.name || n.metadata?.title || n.metadata?.description || null
-      const existing = channels[jid]
-      const resolvedName = existing?.custom_name || name || existing?.name || jid.split("@")[0]
-      if (!existing) channels[jid] = { jid, name: resolvedName, lastMessage: "", timestamp: 0, unread: 0 }
-      else channels[jid].name = resolvedName
-      await dbUpsert(jid, { name: resolvedName, is_channel: true, last_message: channels[jid].lastMessage || "", timestamp: channels[jid].timestamp || 0, unread: channels[jid].unread || 0, archived: false })
-    }
-    broadcast({ type: "contacts_updated" })
   })
 
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
@@ -410,16 +365,15 @@ const startSock = async () => {
     for (const msg of msgs) {
       const result = await processMsg(msg, false)
       if (!result) continue
-      const { entry, jid, isCh } = result
+      const { entry, jid } = result
       if (!messages[jid]) messages[jid] = []
       if (!messages[jid].find(e => e.id === entry.id)) {
         messages[jid].push(entry)
         if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
       }
-      const store = isCh ? channels : contacts
-      if (store[jid] && entry.timestamp > (store[jid].timestamp || 0)) {
-        store[jid].lastMessage = entry.body || store[jid].lastMessage
-        store[jid].timestamp = entry.timestamp
+      if (contacts[jid] && entry.timestamp > (contacts[jid].timestamp || 0)) {
+        contacts[jid].lastMessage = entry.body || contacts[jid].lastMessage
+        contacts[jid].timestamp = entry.timestamp
       }
     }
     broadcast({ type: "chats_loaded" })
@@ -429,12 +383,8 @@ const startSock = async () => {
     for (const msg of msgs) {
       const jid = msg.key?.remoteJid
       if (!isValid(jid)) continue
-      const isCh = isChannelJid(jid)
-      // Para conversas individuais, processa "notify" (novas) e "append" (histórico recente)
-      // Para canais, processa todos os tipos
-      if (!isCh && type !== "notify" && type !== "append") continue
+      if (type !== "notify" && type !== "append") continue
 
-      // Não tenta baixar mídia de mensagens históricas (chaves expiradas)
       const isNew = type === "notify"
       const result = await processMsg(msg, isNew)
       if (!result) continue
@@ -444,18 +394,15 @@ const startSock = async () => {
         messages[jid].push(entry)
         if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
       }
-      const store = isCh ? channels : contacts
-      // pushName: usa se não tiver nome na agenda e mensagem não for nossa
-      const hasAgendaName = store[jid]?.phone_book_name || store[jid]?.custom_name
+      const hasAgendaName = contacts[jid]?.phone_book_name || contacts[jid]?.custom_name
       const pushName = (!fromMe && !hasAgendaName && msg.pushName) ? msg.pushName : null
       const lastMsg = entry.body || (entry.mediaData ? getMediaLabel(null, entry.mediaType) : null)
-      await upsertContact(jid, pushName, entry.timestamp, fromMe ? 0 : 1, lastMsg, isCh)
-      // Se atualizou nome via pushName, salva no DB
-      if (pushName && store[jid]) {
-        store[jid].name = pushName
-        await dbUpsert(jid, { name: pushName, last_message: store[jid].lastMessage, timestamp: store[jid].timestamp, unread: store[jid].unread, archived: store[jid].archived || false, is_channel: isCh })
+      await upsertContact(jid, pushName, entry.timestamp, fromMe ? 0 : 1, lastMsg)
+      if (pushName && contacts[jid]) {
+        contacts[jid].name = pushName
+        await dbUpsert(jid, { name: pushName, last_message: contacts[jid].lastMessage, timestamp: contacts[jid].timestamp, unread: contacts[jid].unread, archived: contacts[jid].archived || false, is_channel: false })
       }
-      broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel: isCh })
+      broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
     }
   })
 }
@@ -465,14 +412,7 @@ app.get("/status", (req, res) => res.json({ connected, qr: qrCode }))
 
 app.get("/contacts", (req, res) => {
   const list = Object.values(contacts)
-    .filter(c => isIndividual(c.jid) && !c.archived && c.timestamp > 0)
-    .sort((a, b) => b.timestamp - a.timestamp)
-  res.json(list)
-})
-
-app.get("/channels", (req, res) => {
-  const list = Object.values(channels)
-    .filter(c => isChannelJid(c.jid))
+    .filter(c => !c.archived && c.timestamp > 0)
     .sort((a, b) => b.timestamp - a.timestamp)
   res.json(list)
 })
@@ -486,29 +426,26 @@ app.get("/archived", (req, res) => {
 
 app.post("/archive/:jid", async (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
-  const store = contacts[jid] ? contacts : channels[jid] ? channels : null
-  if (!store) return res.json({ archived: false })
-  store[jid].archived = !store[jid].archived
-  await dbUpsert(jid, { archived: store[jid].archived })
-  res.json({ archived: store[jid].archived })
+  if (!contacts[jid]) return res.json({ archived: false })
+  contacts[jid].archived = !contacts[jid].archived
+  await dbUpsert(jid, { archived: contacts[jid].archived })
+  res.json({ archived: contacts[jid].archived })
 })
 
 app.post("/rename/:jid", async (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   const { name } = req.body
-  const store = contacts[jid] ? contacts : channels[jid] ? channels : null
-  if (!store) return res.json({ ok: false })
+  if (!contacts[jid]) return res.json({ ok: false })
   const customName = name?.trim() || null
-  store[jid].custom_name = customName
-  store[jid].name = customName || store[jid].phone_book_name || jid.split("@")[0]
-  await dbUpsert(jid, { custom_name: customName, name: store[jid].name })
+  contacts[jid].custom_name = customName
+  contacts[jid].name = customName || contacts[jid].phone_book_name || jid.split("@")[0]
+  await dbUpsert(jid, { custom_name: customName, name: contacts[jid].name })
   res.json({ ok: true })
 })
 
 app.get("/messages/:jid", (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (contacts[jid]) contacts[jid].unread = 0
-  if (channels[jid]) channels[jid].unread = 0
   dbUpsert(jid, { unread: 0 }).catch(() => {})
   res.json((messages[jid] || []).slice(-100))
 })
@@ -528,7 +465,34 @@ app.post("/send", async (req, res) => {
     const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: text, timestamp: Math.floor(Date.now() / 1000) }
     if (!messages[jid]) messages[jid] = []
     messages[jid].push(entry)
-    await upsertContact(jid, null, entry.timestamp, 0, text, false)
+    await upsertContact(jid, null, entry.timestamp, 0, text)
+    broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post("/send-media", async (req, res) => {
+  const { jid, base64, mimetype, filename } = req.body
+  if (!sock || !connected) return res.status(503).json({ error: "Não conectado" })
+  if (!jid || !base64 || !mimetype) return res.status(400).json({ error: "Parâmetros inválidos" })
+  try {
+    const buffer = Buffer.from(base64, "base64")
+    let content
+    if (mimetype.startsWith("image/")) {
+      content = { image: buffer, mimetype }
+    } else if (mimetype.startsWith("audio/")) {
+      content = { audio: buffer, mimetype, ptt: false }
+    } else if (mimetype.startsWith("video/")) {
+      content = { video: buffer, mimetype, fileName: filename }
+    } else {
+      content = { document: buffer, mimetype, fileName: filename || "arquivo" }
+    }
+    await sock.sendMessage(jid, content)
+    const label = mimetype.startsWith("image/") ? "📷 Imagem" : mimetype.startsWith("audio/") ? "🎵 Áudio" : mimetype.startsWith("video/") ? "🎥 Vídeo" : `📄 ${filename || "Arquivo"}`
+    const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: label, timestamp: Math.floor(Date.now() / 1000) }
+    if (!messages[jid]) messages[jid] = []
+    messages[jid].push(entry)
+    await upsertContact(jid, null, entry.timestamp, 0, label)
     broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
     res.json({ ok: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
