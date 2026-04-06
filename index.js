@@ -358,22 +358,6 @@ const startSock = async () => {
     broadcast({ type: "contacts_updated" })
   })
 
-  // Busca nomes dos canais via metadata após conectar
-  sock.ev.on("chats.upsert", async (list) => {
-    const channelJids = list.filter(c => isChannelJid(c.id)).map(c => c.id)
-    for (const jid of channelJids) {
-      if (channels[jid]?.name && !channels[jid].name.startsWith("+") && !/^\d/.test(channels[jid].name)) continue
-      try {
-        const meta = await sock.newsletterMetadata("invite", jid).catch(() => null)
-        if (meta?.name) {
-          channels[jid] = channels[jid] || { jid, lastMessage: "", timestamp: 0, unread: 0 }
-          if (!channels[jid].custom_name) channels[jid].name = meta.name
-          await dbUpsert(jid, { name: channels[jid].name, is_channel: true })
-        }
-      } catch {}
-    }
-  })
-
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
     console.log(`Histórico: ${msgs.length} msgs`)
     for (const msg of msgs) {
