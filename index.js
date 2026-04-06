@@ -348,12 +348,30 @@ const startSock = async () => {
     for (const n of (list || [])) {
       const jid = n.id
       if (!jid) continue
-      const name = n.name || n.metadata?.name || n.metadata?.title || null
-      if (!channels[jid]) channels[jid] = { jid, name: name || jid.split("@")[0], lastMessage: "", timestamp: 0, unread: 0 }
-      else if (name && !channels[jid].custom_name) channels[jid].name = name
-      await dbUpsert(jid, { name: channels[jid].name, is_channel: true, last_message: "", timestamp: 0, unread: 0, archived: false })
+      const name = n.name || n.metadata?.name || n.metadata?.title || n.metadata?.description || null
+      const existing = channels[jid]
+      const resolvedName = existing?.custom_name || name || existing?.name || jid.split("@")[0]
+      if (!existing) channels[jid] = { jid, name: resolvedName, lastMessage: "", timestamp: 0, unread: 0 }
+      else channels[jid].name = resolvedName
+      await dbUpsert(jid, { name: resolvedName, is_channel: true, last_message: channels[jid].lastMessage || "", timestamp: channels[jid].timestamp || 0, unread: channels[jid].unread || 0, archived: false })
     }
     broadcast({ type: "contacts_updated" })
+  })
+
+  // Busca nomes dos canais via metadata após conectar
+  sock.ev.on("chats.upsert", async (list) => {
+    const channelJids = list.filter(c => isChannelJid(c.id)).map(c => c.id)
+    for (const jid of channelJids) {
+      if (channels[jid]?.name && !channels[jid].name.startsWith("+") && !/^\d/.test(channels[jid].name)) continue
+      try {
+        const meta = await sock.newsletterMetadata("invite", jid).catch(() => null)
+        if (meta?.name) {
+          channels[jid] = channels[jid] || { jid, lastMessage: "", timestamp: 0, unread: 0 }
+          if (!channels[jid].custom_name) channels[jid].name = meta.name
+          await dbUpsert(jid, { name: channels[jid].name, is_channel: true })
+        }
+      } catch {}
+    }
   })
 
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
@@ -377,22 +395,33 @@ const startSock = async () => {
   })
 
   sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
-    if (type !== "notify") return
     for (const msg of msgs) {
+      const jid = msg.key?.remoteJid
+      if (!isValid(jid)) continue
+      const isCh = isChannelJid(jid)
+      // Para conversas individuais, só processa tipo "notify" (mensagens novas)
+      // Para canais, processa todos os tipos
+      if (!isCh && type !== "notify") continue
+
       const result = await processMsg(msg, true)
       if (!result) continue
-      const { entry, jid, isCh, fromMe } = result
+      const { entry, fromMe } = result
       if (!messages[jid]) messages[jid] = []
       if (!messages[jid].find(e => e.id === entry.id)) {
         messages[jid].push(entry)
         if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
       }
-      // pushName só de mensagens recebidas e se não houver nome na agenda
       const store = isCh ? channels : contacts
+      // pushName: usa se não tiver nome na agenda e mensagem não for nossa
       const hasAgendaName = store[jid]?.phone_book_name || store[jid]?.custom_name
-      const pushName = (!fromMe && !hasAgendaName) ? msg.pushName : null
+      const pushName = (!fromMe && !hasAgendaName && msg.pushName) ? msg.pushName : null
       const lastMsg = entry.body || (entry.mediaData ? getMediaLabel(null, entry.mediaType) : null)
       await upsertContact(jid, pushName, entry.timestamp, fromMe ? 0 : 1, lastMsg, isCh)
+      // Se atualizou nome via pushName, salva no DB
+      if (pushName && store[jid]) {
+        store[jid].name = pushName
+        await dbUpsert(jid, { name: pushName, last_message: store[jid].lastMessage, timestamp: store[jid].timestamp, unread: store[jid].unread, archived: store[jid].archived || false, is_channel: isCh })
+      }
       broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel: isCh })
     }
   })
