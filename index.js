@@ -3,7 +3,7 @@ import cors from "cors"
 import http from "http"
 import { WebSocketServer } from "ws"
 import QRCode from "qrcode"
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from "@whiskeysockets/baileys"
+import makeWASocket, { initAuthCreds, BufferJSON, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from "@whiskeysockets/baileys"
 import { Boom } from "@hapi/boom"
 import { createClient } from "@supabase/supabase-js"
 import path from "path"
@@ -15,6 +15,53 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_KEY
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null
+
+// Auth state persistido no Supabase (sobrevive redeploys)
+const useSupabaseAuthState = async () => {
+  const get = async (key) => {
+    if (!supabase) return null
+    try {
+      const { data } = await supabase.from("wapp_auth").select("value").eq("key", key).single()
+      return data?.value ? JSON.parse(JSON.stringify(data.value), BufferJSON.reviver) : null
+    } catch { return null }
+  }
+  const set = async (key, value) => {
+    if (!supabase) return
+    try {
+      await supabase.from("wapp_auth").upsert({ key, value: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) }, { onConflict: "key" })
+    } catch (e) { console.error("auth set error:", e.message) }
+  }
+  const del = async (key) => {
+    if (!supabase) return
+    try { await supabase.from("wapp_auth").delete().eq("key", key) } catch {}
+  }
+
+  const creds = await get("creds") || initAuthCreds()
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {}
+          await Promise.all(ids.map(async id => {
+            const val = await get(`key-${type}-${id}`)
+            if (val) data[id] = val
+          }))
+          return data
+        },
+        set: async (data) => {
+          await Promise.all(Object.entries(data).flatMap(([type, ids]) =>
+            Object.entries(ids).map(([id, val]) =>
+              val ? set(`key-${type}-${id}`, val) : del(`key-${type}-${id}`)
+            )
+          ))
+        },
+      },
+    },
+    saveCreds: () => set("creds", creds),
+  }
+}
 
 const app = express()
 app.use(cors())
@@ -205,12 +252,30 @@ const upsertContact = async (jid, pushName, ts, unread, lastMessage, isCh = fals
 }
 
 const startSock = async () => {
-  const authDir = path.join(__dirname, "auth_info")
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir)
-  const { state, saveCreds } = await useMultiFileAuthState(authDir)
+  // Usa Supabase para auth se disponível, senão fallback para arquivo
+  let state, saveCreds
+  if (supabase) {
+    const auth = await useSupabaseAuthState()
+    state = auth.state
+    saveCreds = auth.saveCreds
+    console.log("Auth via Supabase")
+  } else {
+    const authDir = path.join(__dirname, "auth_info")
+    if (!fs.existsSync(authDir)) fs.mkdirSync(authDir)
+    const auth = await useMultiFileAuthState(authDir)
+    state = auth.state
+    saveCreds = auth.saveCreds
+    console.log("Auth via arquivo")
+  }
+
   const { version } = await fetchLatestBaileysVersion()
 
-  sock = makeWASocket({ version, auth: state, browser: ["TraderHub", "Chrome", "1.0.0"], syncFullHistory: false })
+  sock = makeWASocket({
+    version,
+    auth: state,
+    browser: ["TraderHub", "Chrome", "1.0.0"],
+    syncFullHistory: true, // puxa histórico completo
+  })
 
   sock.ev.on("creds.update", saveCreds)
 
