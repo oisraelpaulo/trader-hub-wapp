@@ -273,8 +273,8 @@ const startSock = async () => {
   sock = makeWASocket({
     version,
     auth: state,
-    browser: ["TraderHub", "Chrome", "1.0.0"],
-    syncFullHistory: true, // puxa histórico completo
+    browser: ["Ubuntu", "Chrome", "22.0.0.0"],
+    syncFullHistory: false,
   })
 
   sock.ev.on("creds.update", saveCreds)
@@ -294,7 +294,11 @@ const startSock = async () => {
       if (shouldReconnect) { console.log("Reconectando..."); setTimeout(startSock, 3000) }
       else {
         console.log("Deslogado. Limpando auth...")
-        fs.rmSync(path.join(__dirname, "auth_info"), { recursive: true, force: true })
+        if (supabase) {
+          try { await supabase.from("wapp_auth").delete().neq("key", "__none__") } catch {}
+        } else {
+          fs.rmSync(path.join(__dirname, "auth_info"), { recursive: true, force: true })
+        }
         setTimeout(startSock, 1000)
       }
     }
@@ -383,11 +387,13 @@ const startSock = async () => {
       const jid = msg.key?.remoteJid
       if (!isValid(jid)) continue
       const isCh = isChannelJid(jid)
-      // Para conversas individuais, só processa tipo "notify" (mensagens novas)
+      // Para conversas individuais, processa "notify" (novas) e "append" (histórico recente)
       // Para canais, processa todos os tipos
-      if (!isCh && type !== "notify") continue
+      if (!isCh && type !== "notify" && type !== "append") continue
 
-      const result = await processMsg(msg, true)
+      // Não tenta baixar mídia de mensagens históricas (chaves expiradas)
+      const isNew = type === "notify"
+      const result = await processMsg(msg, isNew)
       if (!result) continue
       const { entry, fromMe } = result
       if (!messages[jid]) messages[jid] = []
