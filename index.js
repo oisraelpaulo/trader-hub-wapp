@@ -102,11 +102,18 @@ const buildName = (jid, pushName) => {
   return (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
 }
 
+const MIME_MAP = {
+  image: "image/jpeg",
+  sticker: "image/webp",
+  audio: "audio/ogg; codecs=opus",
+  video: "video/mp4",
+}
+
 const tryDownload = async (msg, mediaType) => {
   try {
     const buffer = await downloadMediaMessage(msg, "buffer", {})
     if (!buffer || buffer.length === 0) return null
-    const mime = mediaType === "sticker" ? "image/webp" : "image/jpeg"
+    const mime = MIME_MAP[mediaType] || "application/octet-stream"
     return `data:${mime};base64,${buffer.toString("base64")}`
   } catch {
     return null
@@ -137,21 +144,20 @@ const processMsg = async (msg, downloadMedia = false) => {
   const text = getBodyText(m)
 
   let body = text
-  let imageData = null
+  let mediaData = null // base64 para image/sticker/audio
 
   if (!body) {
     if (viewOnce) {
       body = mediaType === "video" ? "🎥 Vídeo de visualização única — abra no celular" : "📷 Foto de visualização única — abra no celular"
-    } else if (mediaType === "image" && downloadMedia) {
-      imageData = await tryDownload(msg, "image")
-      body = m.imageMessage?.caption || (imageData ? "" : "📷 Imagem")
-    } else if (mediaType === "sticker" && downloadMedia) {
-      imageData = await tryDownload(msg, "sticker")
-      body = imageData ? "" : "🎭 Sticker"
+    } else if ((mediaType === "image" || mediaType === "sticker" || mediaType === "audio") && downloadMedia) {
+      mediaData = await tryDownload(msg, mediaType)
+      if (mediaType === "image") body = m.imageMessage?.caption || (mediaData ? "" : "📷 Imagem")
+      else if (mediaType === "sticker") body = mediaData ? "" : "🎭 Sticker"
+      else if (mediaType === "audio") body = mediaData ? "" : "🎵 Áudio"
     } else if (mediaType) {
       body = getMediaLabel(m, mediaType)
     } else {
-      return null // sem conteúdo identificável, ignora
+      return null
     }
   }
 
@@ -165,7 +171,7 @@ const processMsg = async (msg, downloadMedia = false) => {
       from: msg.key.fromMe ? "me" : jid,
       fromMe: !!msg.key.fromMe,
       body: body || "",
-      imageData: imageData || undefined,
+      mediaData: mediaData || undefined,
       mediaType: mediaType || undefined,
       viewOnce,
       timestamp: ts,
@@ -333,9 +339,10 @@ const startSock = async () => {
         if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
       }
       const store = isCh ? channels : contacts
-      // pushName só usado se não tiver nome na agenda
-      const msgName = phoneBookNames[jid] ? null : msg.pushName
-      upsertContact(jid, msgName, entry.timestamp, isFromMe ? 0 : 1, entry.body || (entry.imageData ? (entry.mediaType === "sticker" ? "🎭 Sticker" : "📷 Imagem") : null))
+      // pushName só serve para mensagens recebidas (fromMe=false) e se não houver nome na agenda
+      const msgName = (!isFromMe && !phoneBookNames[jid]) ? msg.pushName : null
+      const lastMsg = entry.body || (entry.mediaData ? getMediaLabel(null, entry.mediaType) : null)
+      upsertContact(jid, msgName, entry.timestamp, isFromMe ? 0 : 1, lastMsg)
       saveContactsCache()
       broadcast({ type: "message", jid, message: entry, contact: store[jid], isChannel: isCh })
     }
