@@ -73,6 +73,7 @@ const wss = new WebSocketServer({ server })
 let sock = null
 let qrCode = null
 let connected = false
+let reconnecting = false
 let messages = {}
 let contacts = {}
 let channels = {}
@@ -158,20 +159,42 @@ const MIME_MAP = {
   video: "video/mp4",
 }
 
+const silentLogger = { level: () => {}, trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => ({}) }
+
 const tryDownload = async (msg, mediaType) => {
+  // Verifica se mediaKey existe — sem ela é impossível descriptografar
+  const fieldMap = { image: "imageMessage", sticker: "stickerMessage", audio: "audioMessage", video: "videoMessage" }
+  const mediaObj = msg.message?.[fieldMap[mediaType]]
+  if (!mediaObj) return null
+
+  let msgToUse = msg
+  // Se mediaKey ausente/vazio, tenta atualizar o msg via WA para obter chaves frescas
+  if (!mediaObj.mediaKey || mediaObj.mediaKey.length === 0) {
+    try {
+      const refreshed = await Promise.race([
+        sock?.updateMediaMessage(msg),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000))
+      ])
+      if (refreshed) msgToUse = refreshed
+      else return null
+    } catch { return null }
+  }
+
   try {
     const buffer = await downloadMediaMessage(
-      msg,
+      msgToUse,
       "buffer",
       {},
-      { logger: { level: () => {}, trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {}, child: () => ({}) }, reuploadRequest: sock?.updateMediaMessage }
+      { logger: silentLogger, reuploadRequest: sock?.updateMediaMessage }
     )
     if (!buffer || buffer.length === 0) return null
     const mime = MIME_MAP[mediaType] || "application/octet-stream"
     console.log(`Downloaded ${mediaType}: ${buffer.length} bytes`)
     return `data:${mime};base64,${buffer.toString("base64")}`
   } catch (e) {
-    console.error(`tryDownload(${mediaType}) failed:`, e.message)
+    if (e.message && !e.message.includes("empty media key") && !e.message.includes("timed out")) {
+      console.error(`tryDownload(${mediaType}) failed:`, e.message)
+    }
     return null
   }
 }
@@ -285,14 +308,34 @@ const startSock = async () => {
       qrCode = null; connected = true
       broadcast({ type: "connected" })
       console.log("WhatsApp conectado!")
+      // Busca metadados dos canais sem nome
+      setTimeout(async () => {
+        const unnamed = Object.values(channels).filter(c => !c.name || c.name === c.jid.split("@")[0])
+        for (const ch of unnamed.slice(0, 20)) {
+          try {
+            const meta = await sock.getNewsletterInfo(ch.jid)
+            const name = meta?.name || meta?.metadata?.name || null
+            if (name) {
+              channels[ch.jid].name = name
+              await dbUpsert(ch.jid, { name, is_channel: true })
+            }
+          } catch {}
+        }
+        if (unnamed.length > 0) broadcast({ type: "contacts_updated" })
+      }, 5000)
     }
     if (connection === "close") {
       connected = false
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut : true
       broadcast({ type: "disconnected" })
-      if (shouldReconnect) { console.log("Reconectando..."); setTimeout(startSock, 3000) }
-      else {
+      if (shouldReconnect) {
+        if (!reconnecting) {
+          reconnecting = true
+          console.log("Reconectando...")
+          setTimeout(() => { reconnecting = false; startSock() }, 3000)
+        }
+      } else {
         console.log("Deslogado. Limpando auth...")
         if (supabase) {
           try { await supabase.from("wapp_auth").delete().neq("key", "__none__") } catch {}
