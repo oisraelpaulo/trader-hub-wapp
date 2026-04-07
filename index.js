@@ -599,8 +599,21 @@ app.post("/send-media", async (req, res) => {
     else if (mimetype.startsWith("video/")) content = { video: buffer, mimetype, fileName: filename }
     else content = { document: buffer, mimetype, fileName: filename || "arquivo" }
     await sock.sendMessage(jid, content)
-    const label = mimetype.startsWith("image/") ? "📷 Imagem" : mimetype.startsWith("audio/") ? "🎵 Áudio" : mimetype.startsWith("video/") ? "🎥 Vídeo" : `📄 ${filename || "Arquivo"}`
-    const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: label, timestamp: Math.floor(Date.now() / 1000) }
+    const isImage = mimetype.startsWith("image/")
+    const isAudio = mimetype.startsWith("audio/")
+    const isVideo = mimetype.startsWith("video/")
+    const label = isImage ? "📷 Imagem" : isAudio ? "🎵 Áudio" : isVideo ? "🎥 Vídeo" : `📄 ${filename || "Arquivo"}`
+    const mediaType = isImage ? "image" : isAudio ? "audio" : isVideo ? "video" : "document"
+    const dataUri = `data:${mimetype};base64,${base64}`
+    // Salva media data para imagem e áudio (se < 500KB)
+    const saveMedia = (isImage || isAudio) && base64.length < 500000
+    const entry = {
+      id: Date.now().toString(), from: "me", fromMe: true,
+      body: isAudio ? "" : label,
+      mediaType,
+      mediaData: saveMedia ? dataUri : undefined,
+      timestamp: Math.floor(Date.now() / 1000),
+    }
     addMessage(jid, entry)
     upsertContact(jid, null, entry.timestamp, 0, label)
     broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
