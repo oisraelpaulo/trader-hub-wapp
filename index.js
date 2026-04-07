@@ -105,8 +105,12 @@ function resolveName(jid, contact, pushName) {
   if (contact?.custom_name) return contact.custom_name
   if (contact?.phone_book_name) return contact.phone_book_name
   if (pushName) return pushName
+  if (contact?.push_name) return contact.push_name
   if (contact?.name && contact.name !== formatNumber(jid)) return contact.name
-  return formatNumber(jid)
+  const num = formatNumber(jid)
+  // Se o número é só um LID sem mapeamento, retorna o ID limpo ao invés do @lid
+  if (jid?.endsWith("@lid") && !lidToPhone[jid]) return jid.split("@")[0]
+  return num
 }
 
 // ── DB: Contacts ──
@@ -126,6 +130,7 @@ async function dbLoadContacts() {
         archived: row.archived || false,
         phone_book_name: row.phone_book_name || null,
         custom_name: row.custom_name || null,
+        push_name: row.name || null, // 'name' column stores push_name as fallback
       }
     }
     console.log(`DB: ${Object.keys(contacts).length} contatos carregados`)
@@ -137,7 +142,7 @@ async function dbSave(jid) {
   const c = contacts[jid]
   try {
     await supabase.from("wapp_contacts").upsert({
-      jid, name: c.name, last_message: c.lastMessage, timestamp: c.timestamp,
+      jid, name: c.push_name || c.name, last_message: c.lastMessage, timestamp: c.timestamp,
       unread: c.unread, archived: c.archived || false, is_channel: false,
       phone_book_name: c.phone_book_name || null, custom_name: c.custom_name || null,
     }, { onConflict: "jid" })
@@ -276,9 +281,14 @@ function upsertContact(jid, pushName, ts, unreadDelta, lastMsg) {
       lastMessage: lastMsg || "", timestamp: ts || 0,
       unread: unreadDelta || 0, archived: false,
       phone_book_name: null, custom_name: null,
+      push_name: pushName || null,
     }
   } else {
-    if (!existing.custom_name && !existing.phone_book_name && pushName) existing.name = pushName
+    // Salva pushName se recebido (nome que a pessoa colocou no WhatsApp)
+    if (pushName && !existing.push_name) existing.push_name = pushName
+    if (!existing.custom_name && !existing.phone_book_name) {
+      existing.name = resolveName(jid, existing, pushName)
+    }
     if (ts && ts > existing.timestamp) existing.timestamp = ts
     if (lastMsg) existing.lastMessage = lastMsg
     if (unreadDelta) existing.unread = (existing.unread || 0) + unreadDelta
@@ -528,7 +538,8 @@ async function startSock() {
 
       addMessage(jid, entry)
 
-      const pushName = (!fromMe && !contacts[jid]?.phone_book_name && !contacts[jid]?.custom_name && msg.pushName) ? msg.pushName : null
+      // Sempre passa o pushName para salvar como fallback
+      const pushName = (!fromMe && msg.pushName) ? msg.pushName : null
       const lastMsg = entry.body || mediaLabel(entry.mediaType, null)
       upsertContact(jid, pushName, entry.timestamp, fromMe ? 0 : 1, lastMsg)
 
