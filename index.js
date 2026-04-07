@@ -130,7 +130,8 @@ async function dbLoadContacts() {
         archived: row.archived || false,
         phone_book_name: row.phone_book_name || null,
         custom_name: row.custom_name || null,
-        push_name: row.name || null, // 'name' column stores push_name as fallback
+        push_name: row.name || null,
+        pinned: row.pinned || false,
       }
     }
     console.log(`DB: ${Object.keys(contacts).length} contatos carregados`)
@@ -145,6 +146,7 @@ async function dbSave(jid) {
       jid, name: c.push_name || c.name, last_message: c.lastMessage, timestamp: c.timestamp,
       unread: c.unread, archived: c.archived || false, is_channel: false,
       phone_book_name: c.phone_book_name || null, custom_name: c.custom_name || null,
+      pinned: c.pinned || false,
     }, { onConflict: "jid" })
   } catch (e) { console.error("dbSave:", e.message) }
 }
@@ -564,12 +566,31 @@ async function startSock() {
 app.get("/status", (_, res) => res.json({ connected, qr: qrCode }))
 
 app.get("/contacts", (_, res) => {
-  const list = Object.values(contacts).filter(c => !c.archived).sort((a, b) => b.timestamp - a.timestamp)
+  // Só retorna contatos que têm conversa (mensagens ou lastMessage ou unread)
+  const list = Object.values(contacts)
+    .filter(c => !c.archived && (messages[c.jid]?.length > 0 || c.lastMessage || c.unread > 0 || c.pinned))
+    .sort((a, b) => {
+      // Fixados primeiro, depois por timestamp
+      if (a.pinned && !b.pinned) return -1
+      if (!a.pinned && b.pinned) return 1
+      return b.timestamp - a.timestamp
+    })
   res.json(list)
 })
 
 app.get("/archived", (_, res) => {
-  const list = Object.values(contacts).filter(c => c.archived).sort((a, b) => b.timestamp - a.timestamp)
+  const list = Object.values(contacts)
+    .filter(c => c.archived && (messages[c.jid]?.length > 0 || c.lastMessage || c.unread > 0))
+    .sort((a, b) => b.timestamp - a.timestamp)
+  res.json(list)
+})
+
+// Agenda: todos os contatos com nome
+app.get("/directory", (_, res) => {
+  const list = Object.values(contacts)
+    .filter(c => c.phone_book_name || c.push_name || c.custom_name)
+    .map(c => ({ jid: c.jid, name: c.name, phone_book_name: c.phone_book_name, push_name: c.push_name, custom_name: c.custom_name }))
+    .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
   res.json(list)
 })
 
@@ -639,6 +660,14 @@ app.post("/archive/:jid", async (req, res) => {
   contacts[jid].archived = !contacts[jid].archived
   dbSave(jid)
   res.json({ archived: contacts[jid].archived })
+})
+
+app.post("/pin/:jid", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  if (!contacts[jid]) return res.json({ pinned: false })
+  contacts[jid].pinned = !contacts[jid].pinned
+  dbSave(jid)
+  res.json({ pinned: contacts[jid].pinned })
 })
 
 app.post("/rename/:jid", async (req, res) => {
