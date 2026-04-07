@@ -232,7 +232,9 @@ async function processMsg(msg, doDownload) {
   const jid = msg.key?.remoteJid
   if (!isValidContact(jid)) return null
   const m = msg.message
-  if (!m || m.protocolMessage || m.reactionMessage || m.messageContextInfo) return null
+  if (!m || m.protocolMessage || m.reactionMessage) return null
+  // Unwrap messageContextInfo — muitas mensagens normais têm esse campo
+  // Só pula se for APENAS messageContextInfo sem conteúdo real
 
   const viewOnce = isViewOnce(m)
   const mediaType = getMediaType(m)
@@ -611,6 +613,55 @@ app.post("/rename/:jid", async (req, res) => {
   contacts[jid].custom_name = customName
   contacts[jid].name = customName || contacts[jid].phone_book_name || formatNumber(jid)
   dbSave(jid)
+  res.json({ ok: true })
+})
+
+app.delete("/chat/:jid", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  // Remove da memória
+  delete contacts[jid]
+  delete messages[jid]
+  // Remove do Supabase
+  if (supabase) {
+    try {
+      await Promise.all([
+        supabase.from("wapp_contacts").delete().eq("jid", jid),
+        supabase.from("wapp_messages").delete().eq("jid", jid),
+      ])
+    } catch (e) { console.error("delete chat:", e.message) }
+  }
+  // Tenta apagar no WhatsApp também (limpar chat)
+  if (sock && connected) {
+    try { await sock.chatModify({ delete: true, lastMessages: [] }, jid) } catch {}
+  }
+  broadcast({ type: "contacts_updated" })
+  res.json({ ok: true })
+})
+
+app.delete("/message/:jid/:msgId", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  const msgId = decodeURIComponent(req.params.msgId)
+  // Remove da memória
+  if (messages[jid]) {
+    messages[jid] = messages[jid].filter(m => m.id !== msgId)
+  }
+  // Remove do Supabase
+  if (supabase) {
+    try { await supabase.from("wapp_messages").delete().eq("id", msgId).eq("jid", jid) } catch {}
+  }
+  // Tenta apagar no WhatsApp (para mim)
+  if (sock && connected) {
+    try { await sock.sendMessage(jid, { delete: { remoteJid: jid, id: msgId, fromMe: true } }) } catch {}
+  }
+  res.json({ ok: true })
+})
+
+app.post("/read/:jid", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  if (contacts[jid]) { contacts[jid].unread = 0; dbSave(jid) }
+  if (sock && connected) {
+    try { await sock.readMessages([{ remoteJid: jid, id: undefined }]) } catch {}
+  }
   res.json({ ok: true })
 })
 
