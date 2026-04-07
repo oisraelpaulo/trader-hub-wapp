@@ -330,6 +330,63 @@ async function startSock() {
 
   sock.ev.on("creds.update", saveCreds)
 
+  // ── History sync (Baileys v7 bulk event) ──
+  sock.ev.on("messaging-history.set", async ({ chats: histChats, contacts: histContacts, messages: histMsgs, isLatest }) => {
+    console.log(`History sync: ${histChats?.length || 0} chats, ${histContacts?.length || 0} contacts, ${histMsgs?.length || 0} msgs`)
+
+    // Process contacts
+    if (histContacts?.length) {
+      for (const c of histContacts) {
+        if (!isValidContact(c.id)) continue
+        const name = c.name || c.notify || c.verifiedName || null
+        if (c.lid && c.id?.endsWith("@s.whatsapp.net")) lidToPhone[c.lid] = c.id
+        if (c.id?.endsWith("@lid") && c.number) lidToPhone[c.id] = c.number + "@s.whatsapp.net"
+        if (!name) continue
+        if (!contacts[c.id]) {
+          contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null }
+        } else {
+          contacts[c.id].phone_book_name = name
+          if (!contacts[c.id].custom_name) contacts[c.id].name = name
+        }
+        dbSave(c.id)
+      }
+    }
+
+    // Process chats
+    if (histChats?.length) {
+      for (const chat of histChats) {
+        if (!isValidContact(chat.id)) continue
+        const name = chat.name || chat.displayName || null
+        const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
+        const archived = !!(chat.archive || chat.archived)
+        upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
+        if (archived && contacts[chat.id]) {
+          contacts[chat.id].archived = true
+          dbSave(chat.id)
+        }
+      }
+    }
+
+    // Process messages
+    if (histMsgs?.length) {
+      let count = 0
+      for (const msg of histMsgs) {
+        const result = await processMsg(msg, false)
+        if (!result) continue
+        const { entry, jid } = result
+        if (addMessage(jid, entry)) count++
+        if (contacts[jid] && entry.timestamp > (contacts[jid].timestamp || 0)) {
+          contacts[jid].lastMessage = entry.body || contacts[jid].lastMessage
+          contacts[jid].timestamp = entry.timestamp
+          dbSave(jid)
+        }
+      }
+      if (count > 0) console.log(`History msgs processed: ${count}`)
+    }
+
+    broadcast({ type: "chats_loaded" })
+  })
+
   // ── Connection ──
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
@@ -409,6 +466,31 @@ async function startSock() {
       upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
     }
     broadcast({ type: "chats_loaded" })
+  })
+
+  sock.ev.on("chats.set", async ({ chats: chatList }) => {
+    if (!chatList?.length) return
+    console.log(`chats.set: ${chatList.length} chats`)
+    for (const chat of chatList) {
+      if (!isValidContact(chat.id)) continue
+      const name = chat.name || chat.displayName || null
+      const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
+      upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
+    }
+    broadcast({ type: "chats_loaded" })
+  })
+
+  sock.ev.on("chats.update", async (updates) => {
+    for (const update of updates) {
+      if (!isValidContact(update.id) || !contacts[update.id]) continue
+      const ts = update.conversationTimestamp
+        ? (typeof update.conversationTimestamp === "object" ? Number(update.conversationTimestamp) : update.conversationTimestamp)
+        : null
+      if (ts && ts > (contacts[update.id].timestamp || 0)) contacts[update.id].timestamp = ts
+      if (update.unreadCount !== undefined) contacts[update.id].unread = update.unreadCount
+      dbSave(update.id)
+    }
+    broadcast({ type: "contacts_updated" })
   })
 
   // ── Historical messages (bulk) ──
@@ -500,7 +582,7 @@ app.post("/send-media", async (req, res) => {
     const buffer = Buffer.from(base64, "base64")
     let content
     if (mimetype.startsWith("image/")) content = { image: buffer, mimetype }
-    else if (mimetype.startsWith("audio/")) content = { audio: buffer, mimetype, ptt: false }
+    else if (mimetype.startsWith("audio/")) content = { audio: buffer, mimetype: "audio/ogg; codecs=opus", ptt: true }
     else if (mimetype.startsWith("video/")) content = { video: buffer, mimetype, fileName: filename }
     else content = { document: buffer, mimetype, fileName: filename || "arquivo" }
     await sock.sendMessage(jid, content)
