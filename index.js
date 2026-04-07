@@ -333,18 +333,24 @@ async function startSock() {
     version,
     auth: state,
     browser: ["Ubuntu", "Chrome", "22.04"],
-    syncFullHistory: false,
+    syncFullHistory: true,
     logger,
     connectTimeoutMs: 20000,
     defaultQueryTimeoutMs: 30000,
     markOnlineOnConnect: true,
+    fireInitQueries: true,
   })
 
   sock.ev.on("creds.update", saveCreds)
 
-  // ── History sync (Baileys v7 bulk event) ──
+  // ── History sync (Baileys v7 bulk event — fires multiple times) ──
+  let syncBatch = 0
   sock.ev.on("messaging-history.set", async ({ chats: histChats, contacts: histContacts, messages: histMsgs, isLatest }) => {
-    console.log(`History sync: ${histChats?.length || 0} chats, ${histContacts?.length || 0} contacts, ${histMsgs?.length || 0} msgs`)
+    syncBatch++
+    const batch = syncBatch
+    console.log(`History sync #${batch}: ${histChats?.length || 0} chats, ${histContacts?.length || 0} contacts, ${histMsgs?.length || 0} msgs (isLatest=${isLatest})`)
+
+    broadcast({ type: "sync_progress", batch, chats: Object.keys(contacts).length, syncing: true })
 
     // Process contacts
     if (histContacts?.length) {
@@ -355,7 +361,7 @@ async function startSock() {
         if (c.id?.endsWith("@lid") && c.number) lidToPhone[c.id] = c.number + "@s.whatsapp.net"
         if (!name) continue
         if (!contacts[c.id]) {
-          contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null }
+          contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null, push_name: null }
         } else {
           contacts[c.id].phone_book_name = name
           if (!contacts[c.id].custom_name) contacts[c.id].name = name
@@ -393,10 +399,16 @@ async function startSock() {
           dbSave(jid)
         }
       }
-      if (count > 0) console.log(`History msgs processed: ${count}`)
+      if (count > 0) console.log(`  → ${count} msgs salvas`)
     }
 
     broadcast({ type: "chats_loaded" })
+    console.log(`  → Total: ${Object.keys(contacts).length} contatos`)
+
+    if (isLatest) {
+      console.log("Sync completo!")
+      broadcast({ type: "sync_progress", batch, chats: Object.keys(contacts).length, syncing: false })
+    }
   })
 
   // ── Connection ──
