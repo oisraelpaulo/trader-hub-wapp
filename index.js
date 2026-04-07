@@ -16,10 +16,8 @@ import pino from "pino"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// ── Logger ──
 const logger = pino({ level: "silent" })
 
-// ── Supabase ──
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_KEY
 const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null
@@ -82,6 +80,7 @@ let qrCode = null
 let connected = false
 let messages = {}
 let contacts = {}
+let lidToPhone = {} // mapeia LID -> número de telefone
 
 function broadcast(data) {
   const json = JSON.stringify(data)
@@ -90,14 +89,18 @@ function broadcast(data) {
 
 // ── JID helpers ──
 function isIndividual(jid) { return jid?.endsWith("@s.whatsapp.net") || jid?.endsWith("@lid") }
-function isGroup(jid) { return jid?.endsWith("@g.us") }
 function isValidContact(jid) { return jid && isIndividual(jid) }
+
 function formatNumber(jid) {
+  // Se temos o mapeamento LID->telefone, usa o telefone
+  if (jid?.endsWith("@lid") && lidToPhone[jid]) {
+    const num = lidToPhone[jid].split("@")[0]
+    return "+" + num
+  }
   const num = jid?.split("@")[0] || ""
   return (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
 }
 
-// ── Contact name resolution ──
 function resolveName(jid, contact, pushName) {
   if (contact?.custom_name) return contact.custom_name
   if (contact?.phone_book_name) return contact.phone_book_name
@@ -106,7 +109,7 @@ function resolveName(jid, contact, pushName) {
   return formatNumber(jid)
 }
 
-// ── DB helpers ──
+// ── DB: Contacts ──
 async function dbLoadContacts() {
   if (!supabase) return
   try {
@@ -126,7 +129,7 @@ async function dbLoadContacts() {
       }
     }
     console.log(`DB: ${Object.keys(contacts).length} contatos carregados`)
-  } catch (e) { console.error("dbLoad:", e.message) }
+  } catch (e) { console.error("dbLoadContacts:", e.message) }
 }
 
 async function dbSave(jid) {
@@ -134,17 +137,48 @@ async function dbSave(jid) {
   const c = contacts[jid]
   try {
     await supabase.from("wapp_contacts").upsert({
-      jid,
-      name: c.name,
-      last_message: c.lastMessage,
-      timestamp: c.timestamp,
-      unread: c.unread,
-      archived: c.archived || false,
-      is_channel: false,
-      phone_book_name: c.phone_book_name || null,
-      custom_name: c.custom_name || null,
+      jid, name: c.name, last_message: c.lastMessage, timestamp: c.timestamp,
+      unread: c.unread, archived: c.archived || false, is_channel: false,
+      phone_book_name: c.phone_book_name || null, custom_name: c.custom_name || null,
     }, { onConflict: "jid" })
   } catch (e) { console.error("dbSave:", e.message) }
+}
+
+// ── DB: Messages (persist in Supabase) ──
+async function dbLoadMessages() {
+  if (!supabase) return
+  try {
+    const { data } = await supabase.from("wapp_messages").select("*").order("timestamp", { ascending: true })
+    if (!data) return
+    let count = 0
+    for (const row of data) {
+      if (!messages[row.jid]) messages[row.jid] = []
+      messages[row.jid].push({
+        id: row.id, from: row.from_me ? "me" : row.jid, fromMe: row.from_me,
+        body: row.body || "", mediaType: row.media_type || undefined,
+        mediaData: row.media_data || undefined, viewOnce: row.view_once || false,
+        timestamp: row.timestamp || 0,
+      })
+      count++
+    }
+    // Limitar a 50 por contato
+    for (const jid of Object.keys(messages)) {
+      if (messages[jid].length > 50) messages[jid] = messages[jid].slice(-50)
+    }
+    console.log(`DB: ${count} msgs carregadas`)
+  } catch (e) { console.error("dbLoadMessages:", e.message) }
+}
+
+async function dbSaveMessage(jid, entry) {
+  if (!supabase) return
+  try {
+    await supabase.from("wapp_messages").upsert({
+      id: entry.id, jid, from_me: entry.fromMe, body: entry.body || "",
+      media_type: entry.mediaType || null,
+      media_data: (entry.mediaData && entry.mediaData.length < 500000) ? entry.mediaData : null,
+      view_once: entry.viewOnce || false, timestamp: entry.timestamp || 0,
+    }, { onConflict: "id,jid" })
+  } catch (e) { console.error("dbSaveMsg:", e.message) }
 }
 
 async function dbClearAuth() {
@@ -185,7 +219,6 @@ async function tryDownload(msg, mediaType) {
   const mediaObj = msg.message?.[FIELD_MAP[mediaType]]
   if (!mediaObj) return null
   if (!mediaObj.mediaKey || mediaObj.mediaKey.length === 0) return null
-
   try {
     const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock?.updateMediaMessage })
     if (!buffer || buffer.length === 0) return null
@@ -256,6 +289,7 @@ function addMessage(jid, entry) {
   if (messages[jid].find(e => e.id === entry.id)) return false
   messages[jid].push(entry)
   if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
+  dbSaveMessage(jid, entry)
   return true
 }
 
@@ -263,7 +297,6 @@ function addMessage(jid, entry) {
 let reconnectTimer = null
 
 async function startSock() {
-  // Limpar socket anterior
   if (sock) {
     try { sock.ev.removeAllListeners() } catch {}
     try { sock.ws.close() } catch {}
@@ -271,7 +304,6 @@ async function startSock() {
   }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
 
-  // Auth
   let state, saveCreds
   if (supabase) {
     const auth = await useSupabaseAuthState()
@@ -306,45 +338,38 @@ async function startSock() {
       broadcast({ type: "qr", qr: qrCode })
       console.log("QR code gerado")
     }
-
     if (connection === "open") {
-      qrCode = null
-      connected = true
+      qrCode = null; connected = true
       broadcast({ type: "connected" })
       console.log("WhatsApp conectado!")
     }
-
     if (connection === "close") {
-      connected = false
-      qrCode = null
+      connected = false; qrCode = null
       broadcast({ type: "disconnected" })
-
       const statusCode = lastDisconnect?.error?.output?.statusCode
-      console.log(`Conexão fechada. Status: ${statusCode || "desconhecido"}`)
-
+      console.log(`Conexão fechada. Status: ${statusCode || "?"}`)
       if (statusCode === DisconnectReason.loggedOut) {
         console.log("Deslogado. Limpando sessão...")
         await dbClearAuth()
-        if (fs.existsSync(path.join(__dirname, "auth_info"))) {
+        if (fs.existsSync(path.join(__dirname, "auth_info")))
           fs.rmSync(path.join(__dirname, "auth_info"), { recursive: true, force: true })
-        }
         reconnectTimer = setTimeout(startSock, 3000)
       } else if (statusCode === DisconnectReason.restartRequired) {
-        console.log("Restart solicitado pelo WA")
         reconnectTimer = setTimeout(startSock, 1000)
       } else {
-        // Stream error, connection lost, etc - espera mais tempo
-        console.log("Reconectando em 5s...")
         reconnectTimer = setTimeout(startSock, 5000)
       }
     }
   })
 
-  // ── Phone book contacts ──
+  // ── Contacts from phone book ──
   sock.ev.on("contacts.upsert", async (list) => {
     for (const c of list) {
       if (!isValidContact(c.id)) continue
       const name = c.name || c.notify || c.verifiedName || null
+      // Mapeia LID -> telefone se disponível
+      if (c.lid && c.id?.endsWith("@s.whatsapp.net")) lidToPhone[c.lid] = c.id
+      if (c.id?.endsWith("@lid") && c.number) lidToPhone[c.id] = c.number + "@s.whatsapp.net"
       if (!name) continue
       if (!contacts[c.id]) {
         contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null }
@@ -353,6 +378,13 @@ async function startSock() {
         if (!contacts[c.id].custom_name) contacts[c.id].name = name
       }
       dbSave(c.id)
+    }
+    // Atualiza nomes com mapeamento LID->telefone
+    for (const [lid, phone] of Object.entries(lidToPhone)) {
+      if (contacts[lid] && !contacts[lid].custom_name && !contacts[lid].phone_book_name) {
+        contacts[lid].name = formatNumber(lid)
+        dbSave(lid)
+      }
     }
     broadcast({ type: "contacts_updated" })
   })
@@ -379,7 +411,7 @@ async function startSock() {
     broadcast({ type: "chats_loaded" })
   })
 
-  // ── Historical messages (bulk sync) ──
+  // ── Historical messages (bulk) ──
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
     let count = 0
     for (const msg of msgs) {
@@ -393,7 +425,7 @@ async function startSock() {
       }
     }
     if (count > 0) {
-      console.log(`Histórico: ${count} msgs processadas`)
+      console.log(`Histórico: ${count} msgs`)
       broadcast({ type: "chats_loaded" })
     }
   })
@@ -471,7 +503,6 @@ app.post("/send-media", async (req, res) => {
     else if (mimetype.startsWith("audio/")) content = { audio: buffer, mimetype, ptt: false }
     else if (mimetype.startsWith("video/")) content = { video: buffer, mimetype, fileName: filename }
     else content = { document: buffer, mimetype, fileName: filename || "arquivo" }
-
     await sock.sendMessage(jid, content)
     const label = mimetype.startsWith("image/") ? "📷 Imagem" : mimetype.startsWith("audio/") ? "🎵 Áudio" : mimetype.startsWith("video/") ? "🎥 Vídeo" : `📄 ${filename || "Arquivo"}`
     const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: label, timestamp: Math.floor(Date.now() / 1000) }
@@ -522,5 +553,6 @@ const PORT = process.env.PORT || 3001
 server.listen(PORT, async () => {
   console.log(`Servidor na porta ${PORT}`)
   await dbLoadContacts()
+  await dbLoadMessages()
   startSock()
 })
