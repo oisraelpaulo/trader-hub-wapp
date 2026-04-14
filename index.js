@@ -365,7 +365,11 @@ async function startSock() {
   sock.ev.on("creds.update", saveCreds)
 
   // ── History sync (Baileys v7 bulk event — fires multiple times) ──
+  // We track all JIDs seen during sync. When isLatest=true, we purge anything not seen.
   let syncBatch = 0
+  const syncSeenJids = new Set()
+  const syncSeenChats = new Set()
+
   sock.ev.on("messaging-history.set", async ({ chats: histChats, contacts: histContacts, messages: histMsgs, isLatest }) => {
     syncBatch++
     const batch = syncBatch
@@ -373,35 +377,40 @@ async function startSock() {
 
     broadcast({ type: "sync_progress", batch, chats: Object.keys(contacts).length, syncing: true })
 
-    // Process contacts
+    // Process contacts (phone book)
     if (histContacts?.length) {
       for (const c of histContacts) {
         if (!isValidContact(c.id)) continue
         const name = c.name || c.notify || c.verifiedName || null
         if (c.lid && c.id?.endsWith("@s.whatsapp.net")) lidToPhone[c.lid] = c.id
         if (c.id?.endsWith("@lid") && c.number) lidToPhone[c.id] = c.number + "@s.whatsapp.net"
+        syncSeenJids.add(c.id)
         if (!name) continue
         if (!contacts[c.id]) {
-          contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null, push_name: null }
+          contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null, push_name: null, pinned: false }
         } else {
           contacts[c.id].phone_book_name = name
           if (!contacts[c.id].custom_name) contacts[c.id].name = name
         }
-        dbSave(c.id)
       }
     }
 
-    // Process chats
+    // Process chats — this is the source of truth for pin/archive/existence
     if (histChats?.length) {
       for (const chat of histChats) {
         if (!isValidContact(chat.id)) continue
+        syncSeenChats.add(chat.id)
+        syncSeenJids.add(chat.id)
         const name = chat.name || chat.displayName || null
         const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
+        // Pin: Baileys sends pin as a timestamp (>0 = pinned) or 0/undefined
+        const pinned = !!(chat.pin || chat.pinned)
+        // Archive: Baileys sends archive as boolean
         const archived = !!(chat.archive || chat.archived)
         upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
-        if (archived && contacts[chat.id]) {
-          contacts[chat.id].archived = true
-          dbSave(chat.id)
+        if (contacts[chat.id]) {
+          contacts[chat.id].archived = archived
+          contacts[chat.id].pinned = pinned
         }
       }
     }
@@ -413,23 +422,46 @@ async function startSock() {
         const result = await processMsg(msg, false)
         if (!result) continue
         const { entry, jid } = result
+        syncSeenJids.add(jid)
         if (addMessage(jid, entry)) count++
         if (contacts[jid] && entry.timestamp > (contacts[jid].timestamp || 0)) {
           contacts[jid].lastMessage = entry.body || contacts[jid].lastMessage
           contacts[jid].timestamp = entry.timestamp
-          dbSave(jid)
         }
       }
       if (count > 0) console.log(`  → ${count} msgs salvas`)
     }
 
-    broadcast({ type: "chats_loaded" })
-    console.log(`  → Total: ${Object.keys(contacts).length} contatos`)
-
+    // ── RECONCILIATION: when sync is complete, purge stale data ──
     if (isLatest) {
-      console.log("Sync completo!")
+      console.log(`Sync completo! Chats do WhatsApp: ${syncSeenChats.size}, Contatos na memória: ${Object.keys(contacts).length}`)
+
+      // Remove contacts that are in our DB but NOT in WhatsApp's chat list
+      let purged = 0
+      for (const jid of Object.keys(contacts)) {
+        // Only purge if this jid was never seen during sync AND has no recent activity
+        if (!syncSeenChats.has(jid) && !syncSeenJids.has(jid)) {
+          console.log(`  Purging stale contact: ${contacts[jid]?.name || jid}`)
+          delete contacts[jid]
+          delete messages[jid]
+          if (supabase) {
+            try { await Promise.all([supabase.from("wapp_contacts").delete().eq("jid", jid), supabase.from("wapp_messages").delete().eq("jid", jid)]) } catch {}
+          }
+          purged++
+        }
+      }
+      if (purged > 0) console.log(`  → Purged ${purged} stale contacts`)
+
+      // Save all contacts to DB with correct pin/archive state
+      for (const jid of Object.keys(contacts)) {
+        dbSave(jid)
+      }
+
+      console.log(`  → Final: ${Object.keys(contacts).length} contatos`)
       broadcast({ type: "sync_progress", batch, chats: Object.keys(contacts).length, syncing: false })
     }
+
+    broadcast({ type: "chats_loaded" })
   })
 
   // ── Connection ──
@@ -503,12 +535,24 @@ async function startSock() {
   })
 
   // ── Chat list ──
+  function syncChatMeta(chat) {
+    if (!isValidContact(chat.id) || !contacts[chat.id]) return
+    // Sync pin: Baileys pin is a timestamp (>0=pinned) or 0/null/undefined
+    if (chat.pin !== undefined) contacts[chat.id].pinned = !!chat.pin
+    if (chat.pinned !== undefined) contacts[chat.id].pinned = !!chat.pinned
+    // Sync archive
+    if (chat.archive !== undefined) contacts[chat.id].archived = !!chat.archive
+    if (chat.archived !== undefined) contacts[chat.id].archived = !!chat.archived
+    dbSave(chat.id)
+  }
+
   sock.ev.on("chats.upsert", async (list) => {
     for (const chat of list) {
       if (!isValidContact(chat.id)) continue
       const name = chat.name || chat.displayName || null
       const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
       upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
+      syncChatMeta(chat)
     }
     broadcast({ type: "chats_loaded" })
   })
@@ -521,38 +565,54 @@ async function startSock() {
       const name = chat.name || chat.displayName || null
       const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
       upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
+      syncChatMeta(chat)
     }
     broadcast({ type: "chats_loaded" })
   })
 
   sock.ev.on("chats.update", async (updates) => {
     for (const update of updates) {
-      if (!isValidContact(update.id) || !contacts[update.id]) continue
-      const ts = update.conversationTimestamp
-        ? (typeof update.conversationTimestamp === "object" ? Number(update.conversationTimestamp) : update.conversationTimestamp)
-        : null
-      if (ts && ts > (contacts[update.id].timestamp || 0)) contacts[update.id].timestamp = ts
-      if (update.unreadCount !== undefined) contacts[update.id].unread = update.unreadCount
-      // Sync archive status from phone
-      if (update.archive !== undefined) {
-        contacts[update.id].archived = !!update.archive
-        console.log(`Chat ${update.id} archived=${update.archive} (synced from phone)`)
-      }
-      if (update.pin !== undefined) {
-        contacts[update.id].pinned = !!update.pin
-        console.log(`Chat ${update.id} pinned=${update.pin} (synced from phone)`)
-      }
-      // Chat deleted on phone (muteExpiration trick or explicit)
+      if (!isValidContact(update.id)) continue
+
+      // Chat deleted on phone
       if (update.delete) {
-        console.log(`Chat ${update.id} deleted (synced from phone)`)
+        console.log(`Chat ${update.id} deleted (chats.update)`)
         delete contacts[update.id]
         delete messages[update.id]
         if (supabase) {
           try { await Promise.all([supabase.from("wapp_contacts").delete().eq("jid", update.id), supabase.from("wapp_messages").delete().eq("jid", update.id)]) } catch {}
         }
-      } else {
-        dbSave(update.id)
+        continue
       }
+
+      if (!contacts[update.id]) continue
+      const c = contacts[update.id]
+
+      // Timestamp
+      const ts = update.conversationTimestamp
+        ? (typeof update.conversationTimestamp === "object" ? Number(update.conversationTimestamp) : update.conversationTimestamp)
+        : null
+      if (ts && ts > (c.timestamp || 0)) c.timestamp = ts
+
+      // Unread
+      if (update.unreadCount !== undefined) c.unread = update.unreadCount
+
+      // Archive — sync from phone
+      if (update.archive !== undefined) {
+        const was = c.archived
+        c.archived = !!update.archive
+        if (was !== c.archived) console.log(`Chat ${c.name || update.id}: archived=${c.archived} (phone sync)`)
+      }
+
+      // Pin — Baileys sends pin as timestamp (>0 = pinned), null/0 = unpinned
+      if (update.pin !== undefined) {
+        const was = c.pinned
+        c.pinned = !!update.pin
+        if (was !== c.pinned) console.log(`Chat ${c.name || update.id}: pinned=${c.pinned} (phone sync)`)
+      }
+      if (update.pinned !== undefined) c.pinned = !!update.pinned
+
+      dbSave(update.id)
     }
     broadcast({ type: "contacts_updated" })
   })
@@ -837,31 +897,43 @@ app.post("/disconnect", async (_, res) => {
   res.json({ ok: true })
 })
 
-// ── Full sync: clean stale contacts that no longer exist on phone ──
+// ── Full sync: force re-sync from WhatsApp ──
+// Clears all local data and lets the history sync rebuild everything fresh
 app.post("/sync", async (_, res) => {
   if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
-  let removed = 0
-  const allJids = Object.keys(contacts)
-  for (const jid of allJids) {
-    try {
-      // Try to check if the chat still exists by fetching a single message
-      // If the contact doesn't exist in WhatsApp anymore, remove it
-      const [result] = await sock.onWhatsApp(jid.replace("@s.whatsapp.net", ""))
-      if (!result?.exists) {
-        console.log(`Sync: removing stale contact ${jid}`)
-        delete contacts[jid]
-        delete messages[jid]
-        if (supabase) {
-          try { await Promise.all([supabase.from("wapp_contacts").delete().eq("jid", jid), supabase.from("wapp_messages").delete().eq("jid", jid)]) } catch {}
-        }
-        removed++
-      }
-    } catch {
-      // If checking fails, skip (don't remove)
+  const before = Object.keys(contacts).length
+  console.log(`Full sync requested. ${before} contacts in memory.`)
+
+  // Clear all local state
+  const oldContacts = { ...contacts }
+  for (const jid of Object.keys(contacts)) {
+    // Keep custom_name so renames survive
+    if (!oldContacts[jid]?.custom_name) {
+      delete contacts[jid]
+      delete messages[jid]
     }
   }
+
+  // Clear Supabase (except custom-named contacts)
+  if (supabase) {
+    try {
+      await supabase.from("wapp_contacts").delete().is("custom_name", null)
+      await supabase.from("wapp_messages").delete().neq("jid", "__none__")
+    } catch (e) { console.error("sync clear:", e.message) }
+  }
+
+  // Force Baileys to re-sync by restarting the socket
+  try {
+    sock.ev.removeAllListeners()
+    sock.ws.close()
+  } catch {}
+  sock = null
+
+  // Restart — history sync will rebuild everything
+  setTimeout(startSock, 2000)
+
   broadcast({ type: "contacts_updated" })
-  res.json({ ok: true, checked: allJids.length, removed })
+  res.json({ ok: true, cleared: before, message: "Re-syncing from WhatsApp..." })
 })
 
 // ── WebSocket ──
