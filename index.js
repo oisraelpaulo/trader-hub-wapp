@@ -165,6 +165,8 @@ async function dbLoadMessages() {
         body: row.body || "", mediaType: row.media_type || undefined,
         mediaData: row.media_data || undefined, viewOnce: row.view_once || false,
         timestamp: row.timestamp || 0,
+        ...(row.status ? { status: row.status } : {}),
+        ...(row.quoted_body ? { quotedMsg: { id: row.quoted_id || null, body: row.quoted_body, fromMe: !!row.quoted_from_me } } : {}),
       })
       count++
     }
@@ -184,6 +186,8 @@ async function dbSaveMessage(jid, entry) {
       media_type: entry.mediaType || null,
       media_data: (entry.mediaData && entry.mediaData.length < 500000) ? entry.mediaData : null,
       view_once: entry.viewOnce || false, timestamp: entry.timestamp || 0,
+      ...(entry.status !== undefined ? { status: entry.status } : {}),
+      ...(entry.quotedMsg ? { quoted_id: entry.quotedMsg.id, quoted_body: entry.quotedMsg.body, quoted_from_me: entry.quotedMsg.fromMe } : {}),
     }, { onConflict: "id,jid" })
   } catch (e) { console.error("dbSaveMsg:", e.message) }
 }
@@ -214,6 +218,18 @@ function isViewOnce(m) {
 }
 
 function getBodyText(m) { return m?.conversation || m?.extendedTextMessage?.text || null }
+
+function getQuotedMsg(m) {
+  const ctx = m?.extendedTextMessage?.contextInfo || m?.imageMessage?.contextInfo || m?.videoMessage?.contextInfo || m?.audioMessage?.contextInfo
+  if (!ctx?.quotedMessage) return undefined
+  const q = ctx.quotedMessage
+  const body = q.conversation || q.extendedTextMessage?.text || (q.imageMessage ? "📷 Imagem" : q.audioMessage ? "🎵 Áudio" : q.videoMessage ? "🎥 Vídeo" : q.documentMessage ? "📄 Documento" : null)
+  return {
+    id: ctx.stanzaId || null,
+    body: body || "Mensagem",
+    fromMe: !!ctx.participant?.endsWith?.("@s.whatsapp.net") === false, // heuristic
+  }
+}
 
 function mediaLabel(mediaType, m) {
   const labels = { image: "📷 Imagem", sticker: "🎭 Sticker", video: "🎥 Vídeo", audio: "🎵 Áudio" }
@@ -267,9 +283,12 @@ async function processMsg(msg, doDownload) {
   }
 
   const ts = typeof msg.messageTimestamp === "object" ? Number(msg.messageTimestamp) : (msg.messageTimestamp || 0)
+  const quotedMsg = getQuotedMsg(m)
+  // Message status: 1=pending, 2=sent(server), 3=delivered, 4=read
+  const status = fromMe ? (msg.status || 1) : undefined
 
   return {
-    entry: { id: msg.key.id, from: fromMe ? "me" : jid, fromMe, body: body || "", mediaData: mediaData || undefined, mediaType: mediaType || undefined, viewOnce, timestamp: ts },
+    entry: { id: msg.key.id, from: fromMe ? "me" : jid, fromMe, body: body || "", mediaData: mediaData || undefined, mediaType: mediaType || undefined, viewOnce, timestamp: ts, ...(quotedMsg ? { quotedMsg } : {}), ...(status !== undefined ? { status } : {}) },
     jid, ts, fromMe,
   }
 }
@@ -514,10 +533,77 @@ async function startSock() {
         : null
       if (ts && ts > (contacts[update.id].timestamp || 0)) contacts[update.id].timestamp = ts
       if (update.unreadCount !== undefined) contacts[update.id].unread = update.unreadCount
-      dbSave(update.id)
+      // Sync archive status from phone
+      if (update.archive !== undefined) {
+        contacts[update.id].archived = !!update.archive
+        console.log(`Chat ${update.id} archived=${update.archive} (synced from phone)`)
+      }
+      if (update.pin !== undefined) {
+        contacts[update.id].pinned = !!update.pin
+        console.log(`Chat ${update.id} pinned=${update.pin} (synced from phone)`)
+      }
+      // Chat deleted on phone (muteExpiration trick or explicit)
+      if (update.delete) {
+        console.log(`Chat ${update.id} deleted (synced from phone)`)
+        delete contacts[update.id]
+        delete messages[update.id]
+        if (supabase) {
+          try { await Promise.all([supabase.from("wapp_contacts").delete().eq("jid", update.id), supabase.from("wapp_messages").delete().eq("jid", update.id)]) } catch {}
+        }
+      } else {
+        dbSave(update.id)
+      }
     }
     broadcast({ type: "contacts_updated" })
   })
+
+  // ── Chat deletion from phone ──
+  sock.ev.on("chats.delete", async (deletedIds) => {
+    for (const jid of deletedIds) {
+      console.log(`Chat ${jid} deleted (chats.delete event)`)
+      delete contacts[jid]
+      delete messages[jid]
+      if (supabase) {
+        try { await Promise.all([supabase.from("wapp_contacts").delete().eq("jid", jid), supabase.from("wapp_messages").delete().eq("jid", jid)]) } catch {}
+      }
+    }
+    broadcast({ type: "contacts_updated" })
+  })
+
+  // ── Message status updates (sent, delivered, read) ──
+  sock.ev.on("messages.update", async (updates) => {
+    for (const update of updates) {
+      const jid = update.key?.remoteJid
+      if (!jid || !messages[jid]) continue
+      const msgId = update.key?.id
+      if (!msgId) continue
+
+      const msg = messages[jid].find(m => m.id === msgId)
+      if (!msg) continue
+
+      // Status: 2=SERVER_ACK(sent), 3=DELIVERY_ACK(delivered), 4=READ(read), 5=PLAYED(audio played)
+      if (update.update?.status !== undefined) {
+        msg.status = update.update.status
+        // Update in Supabase too
+        if (supabase) {
+          try { await supabase.from("wapp_messages").update({ status: msg.status }).eq("id", msgId).eq("jid", jid) } catch {}
+        }
+        broadcast({ type: "message_update", jid, id: msgId, status: msg.status })
+      }
+
+      // Message revoked/deleted
+      if (update.update?.messageStubType === 1 || update.update?.message?.protocolMessage?.type === 0) {
+        messages[jid] = messages[jid].filter(m => m.id !== msgId)
+        if (supabase) {
+          try { await supabase.from("wapp_messages").delete().eq("id", msgId).eq("jid", jid) } catch {}
+        }
+        broadcast({ type: "message_revoke", jid, id: msgId })
+      }
+    }
+  })
+
+  // ── Message revokes (when someone deletes a message for everyone) ──
+  sock.ev.on("messages.reaction", () => {}) // no-op, avoid crash
 
   // ── Historical messages (bulk) ──
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
@@ -608,11 +694,26 @@ app.get("/profile-pic/:jid", async (req, res) => {
 })
 
 app.post("/send", async (req, res) => {
-  const { jid, text } = req.body
+  const { jid, text, quotedId } = req.body
   if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
   try {
-    await sock.sendMessage(jid, { text })
-    const entry = { id: Date.now().toString(), from: "me", fromMe: true, body: text, timestamp: Math.floor(Date.now() / 1000) }
+    const msgContent = { text }
+    // Reply/quote support
+    if (quotedId && messages[jid]) {
+      const quotedMsg = messages[jid].find(m => m.id === quotedId)
+      if (quotedMsg) {
+        msgContent.quoted = { key: { remoteJid: jid, id: quotedId, fromMe: quotedMsg.fromMe }, message: { conversation: quotedMsg.body || "" } }
+      }
+    }
+    const sent = await sock.sendMessage(jid, msgContent)
+    const entry = {
+      id: sent?.key?.id || Date.now().toString(), from: "me", fromMe: true, body: text,
+      timestamp: Math.floor(Date.now() / 1000), status: 1,
+      ...(quotedId && messages[jid] ? (() => {
+        const q = messages[jid].find(m => m.id === quotedId)
+        return q ? { quotedMsg: { id: quotedId, body: q.body, fromMe: q.fromMe } } : {}
+      })() : {}),
+    }
     addMessage(jid, entry)
     upsertContact(jid, null, entry.timestamp, 0, text)
     broadcast({ type: "message", jid, message: entry, contact: contacts[jid] })
@@ -734,6 +835,33 @@ app.post("/disconnect", async (_, res) => {
   try { if (sock) await sock.logout() } catch {}
   connected = false
   res.json({ ok: true })
+})
+
+// ── Full sync: clean stale contacts that no longer exist on phone ──
+app.post("/sync", async (_, res) => {
+  if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
+  let removed = 0
+  const allJids = Object.keys(contacts)
+  for (const jid of allJids) {
+    try {
+      // Try to check if the chat still exists by fetching a single message
+      // If the contact doesn't exist in WhatsApp anymore, remove it
+      const [result] = await sock.onWhatsApp(jid.replace("@s.whatsapp.net", ""))
+      if (!result?.exists) {
+        console.log(`Sync: removing stale contact ${jid}`)
+        delete contacts[jid]
+        delete messages[jid]
+        if (supabase) {
+          try { await Promise.all([supabase.from("wapp_contacts").delete().eq("jid", jid), supabase.from("wapp_messages").delete().eq("jid", jid)]) } catch {}
+        }
+        removed++
+      }
+    } catch {
+      // If checking fails, skip (don't remove)
+    }
+  }
+  broadcast({ type: "contacts_updated" })
+  res.json({ ok: true, checked: allJids.length, removed })
 })
 
 // ── WebSocket ──
