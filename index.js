@@ -406,7 +406,7 @@ async function startSock() {
         // Pin: Baileys sends pin as a timestamp (>0 = pinned) or 0/undefined
         const pinned = !!(chat.pin || chat.pinned)
         // Archive: Baileys sends archive as boolean
-        const archived = !!(chat.archive || chat.archived)
+        const archived = !!(chat.archived || chat.archive)
         upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
         if (contacts[chat.id]) {
           contacts[chat.id].archived = archived
@@ -514,7 +514,7 @@ async function startSock() {
       dbSave(c.id)
     }
     // Atualiza nomes com mapeamento LID->telefone
-    for (const [lid, phone] of Object.entries(lidToPhone)) {
+    for (const [lid] of Object.entries(lidToPhone)) {
       if (contacts[lid] && !contacts[lid].custom_name && !contacts[lid].phone_book_name) {
         contacts[lid].name = formatNumber(lid)
         dbSave(lid)
@@ -541,8 +541,8 @@ async function startSock() {
     if (chat.pin !== undefined) contacts[chat.id].pinned = !!chat.pin
     if (chat.pinned !== undefined) contacts[chat.id].pinned = !!chat.pinned
     // Sync archive
-    if (chat.archive !== undefined) contacts[chat.id].archived = !!chat.archive
     if (chat.archived !== undefined) contacts[chat.id].archived = !!chat.archived
+    else if (chat.archive !== undefined) contacts[chat.id].archived = !!chat.archive
     dbSave(chat.id)
   }
 
@@ -844,9 +844,33 @@ app.post("/rename/:jid", async (req, res) => {
 
 app.delete("/chat/:jid", async (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
+  console.log(`Deleting chat: ${contacts[jid]?.name || jid}`)
+
+  // Tenta apagar no WhatsApp primeiro (antes de limpar local)
+  if (sock && connected) {
+    try {
+      // Para deletar no WhatsApp, precisamos da última mensagem
+      const msgs = messages[jid] || []
+      const lastMsg = msgs[msgs.length - 1]
+      const lastMessages = lastMsg ? [{
+        key: { remoteJid: jid, id: lastMsg.id, fromMe: lastMsg.fromMe },
+        messageTimestamp: lastMsg.timestamp || Math.floor(Date.now() / 1000),
+      }] : [{ key: { remoteJid: jid, id: "none", fromMe: false }, messageTimestamp: Math.floor(Date.now() / 1000) }]
+
+      // chatModify delete = limpa chat no WhatsApp
+      await sock.chatModify({ delete: true, lastMessages }, jid)
+      console.log(`  Chat deleted on WhatsApp: ${jid}`)
+    } catch (e) {
+      console.error(`  Failed to delete on WhatsApp: ${e.message}`)
+      // Tenta método alternativo: clear + archive
+      try { await sock.chatModify({ clear: { messages: [{ id: "all", fromMe: false, timestamp: Math.floor(Date.now() / 1000) }] } }, jid) } catch {}
+    }
+  }
+
   // Remove da memória
   delete contacts[jid]
   delete messages[jid]
+
   // Remove do Supabase
   if (supabase) {
     try {
@@ -854,12 +878,9 @@ app.delete("/chat/:jid", async (req, res) => {
         supabase.from("wapp_contacts").delete().eq("jid", jid),
         supabase.from("wapp_messages").delete().eq("jid", jid),
       ])
-    } catch (e) { console.error("delete chat:", e.message) }
+    } catch (e) { console.error("delete chat db:", e.message) }
   }
-  // Tenta apagar no WhatsApp também (limpar chat)
-  if (sock && connected) {
-    try { await sock.chatModify({ delete: true, lastMessages: [] }, jid) } catch {}
-  }
+
   broadcast({ type: "contacts_updated" })
   res.json({ ok: true })
 })
@@ -897,43 +918,25 @@ app.post("/disconnect", async (_, res) => {
   res.json({ ok: true })
 })
 
-// ── Full sync: force re-sync from WhatsApp ──
-// Clears all local data and lets the history sync rebuild everything fresh
+// ── Full sync: restart socket, keep data, let history sync reconcile ──
 app.post("/sync", async (_, res) => {
   if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
   const before = Object.keys(contacts).length
-  console.log(`Full sync requested. ${before} contacts in memory.`)
+  console.log(`Full sync requested. ${before} contacts in memory. Restarting socket...`)
 
-  // Clear all local state
-  const oldContacts = { ...contacts }
-  for (const jid of Object.keys(contacts)) {
-    // Keep custom_name so renames survive
-    if (!oldContacts[jid]?.custom_name) {
-      delete contacts[jid]
-      delete messages[jid]
-    }
-  }
-
-  // Clear Supabase (except custom-named contacts)
-  if (supabase) {
-    try {
-      await supabase.from("wapp_contacts").delete().is("custom_name", null)
-      await supabase.from("wapp_messages").delete().neq("jid", "__none__")
-    } catch (e) { console.error("sync clear:", e.message) }
-  }
-
-  // Force Baileys to re-sync by restarting the socket
+  // DON'T clear data — let history sync add/update/reconcile
+  // Just restart the socket so Baileys does a fresh history sync
   try {
     sock.ev.removeAllListeners()
     sock.ws.close()
   } catch {}
   sock = null
 
-  // Restart — history sync will rebuild everything
-  setTimeout(startSock, 2000)
+  // Restart — history sync will fire and reconcile
+  setTimeout(startSock, 1500)
 
-  broadcast({ type: "contacts_updated" })
-  res.json({ ok: true, cleared: before, message: "Re-syncing from WhatsApp..." })
+  broadcast({ type: "sync_progress", batch: 0, chats: before, syncing: true })
+  res.json({ ok: true, contacts: before, message: "Re-syncing..." })
 })
 
 // ── WebSocket ──
