@@ -242,6 +242,7 @@ async function dbClearAuth() {
 
 // ── Socket ──
 let reconnectTimer = null
+let wantFullSync = false  // set by /sync endpoint
 
 async function startSock() {
   if (sock) {
@@ -251,10 +252,14 @@ async function startSock() {
   }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
 
-  // Clear all in-memory data on reconnect — fresh state from WhatsApp
-  messages = {}
-  contacts = {}
-  lidToPhone = {}
+  // Only clear memory when a full sync was explicitly requested
+  if (wantFullSync) {
+    console.log("Full sync: limpando memória...")
+    messages = {}
+    contacts = {}
+    lidToPhone = {}
+    wantFullSync = false
+  }
 
   let state, saveCreds
   if (supabase) {
@@ -361,15 +366,40 @@ async function startSock() {
     if (connection === "open") {
       qrCode = null; connected = true
       broadcast({ type: "connected" })
-      console.log("WhatsApp conectado!")
+      const contactCount = Object.keys(contacts).length
+      console.log(`WhatsApp conectado! (${contactCount} contatos em memória)`)
 
+      // Send presence update and try to trigger history sync
       setTimeout(async () => {
         if (!sock || !connected) return
         try {
           if (sock.sendPresenceUpdate) await sock.sendPresenceUpdate("available")
-          console.log("Presence updated, aguardando sync...")
+          console.log("Presence updated")
         } catch (e) { console.error("Presence error:", e.message) }
-      }, 5000)
+
+        // If memory is empty, try requesting history sync
+        if (Object.keys(contacts).length === 0) {
+          console.log("Memória vazia, solicitando history sync...")
+          try {
+            // Baileys v7: request history sync explicitly
+            if (sock.fetchMessageHistory) {
+              await sock.fetchMessageHistory(50, undefined, undefined)
+              console.log("fetchMessageHistory chamado")
+            }
+          } catch (e) { console.error("History request error:", e.message) }
+        }
+
+        // Check status after 20s
+        setTimeout(() => {
+          const count = Object.keys(contacts).length
+          const msgCount = Object.keys(messages).length
+          console.log(`Status: ${count} contatos, ${msgCount} conversas com msgs`)
+          if (count === 0) {
+            console.log("Ainda vazio — use SINCRONIZAR ou reconecte o celular.")
+          }
+          broadcast({ type: "chats_loaded" })
+        }, 20000)
+      }, 3000)
     }
     if (connection === "close") {
       connected = false; qrCode = null
@@ -781,11 +811,13 @@ app.post("/disconnect", async (_, res) => {
   res.json({ ok: true })
 })
 
-// ── Full sync: restart socket, clear memory, let Baileys re-sync everything ──
+// ── Full sync: reconnect socket to trigger fresh history sync ──
 app.post("/sync", async (_, res) => {
   if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
   const before = Object.keys(contacts).length
-  console.log(`Full sync requested. ${before} contacts. Restarting socket...`)
+  console.log(`Full sync requested. ${before} contacts. Reconnecting...`)
+
+  wantFullSync = true  // startSock will clear memory
 
   try {
     sock.ev.removeAllListeners()
@@ -793,11 +825,31 @@ app.post("/sync", async (_, res) => {
   } catch {}
   sock = null
 
-  // startSock() clears memory and re-syncs from WhatsApp
   setTimeout(startSock, 1500)
 
   broadcast({ type: "sync_progress", batch: 0, chats: before, syncing: true })
   res.json({ ok: true, contacts: before, message: "Re-syncing..." })
+})
+
+// ── Hard sync: clear auth + reconnect (requires new QR scan) ──
+app.post("/sync-hard", async (_, res) => {
+  console.log("Hard sync: limpando auth para forçar novo QR + history sync completo")
+
+  wantFullSync = true
+
+  await dbClearAuth()
+  if (fs.existsSync(path.join(__dirname, "auth_info")))
+    fs.rmSync(path.join(__dirname, "auth_info"), { recursive: true, force: true })
+
+  if (sock) {
+    try { sock.ev.removeAllListeners(); sock.ws.close() } catch {}
+    sock = null
+  }
+
+  setTimeout(startSock, 1500)
+
+  broadcast({ type: "sync_progress", batch: 0, chats: 0, syncing: true })
+  res.json({ ok: true, message: "Auth limpo. Escaneie o QR code novamente." })
 })
 
 // ── WebSocket ──
