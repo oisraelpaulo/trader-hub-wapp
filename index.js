@@ -89,12 +89,17 @@ function broadcast(data) {
 
 // ── JID helpers ──
 function isIndividual(jid) { return jid?.endsWith("@s.whatsapp.net") || jid?.endsWith("@lid") }
-function isValidContact(jid) { return jid && isIndividual(jid) }
+function isGroup(jid) { return jid?.endsWith("@g.us") }
+function isValidChat(jid) { return jid && (isIndividual(jid) || isGroup(jid)) }
 
 function formatNumber(jid) {
-  if (jid?.endsWith("@lid") && lidToPhone[jid]) {
-    const num = lidToPhone[jid].split("@")[0]
-    return "+" + num
+  if (isGroup(jid)) return ""
+  // Resolve LID → phone number
+  if (jid?.endsWith("@lid")) {
+    const phone = lidToPhone[jid]
+    if (phone) return "+" + phone.split("@")[0]
+    // Try reverse lookup: find a @s.whatsapp.net contact with matching LID
+    return ""
   }
   const num = jid?.split("@")[0] || ""
   return (/^\d+$/.test(num) && num.length >= 8) ? "+" + num : num
@@ -106,9 +111,12 @@ function resolveName(jid, contact, pushName) {
   if (pushName) return pushName
   if (contact?.push_name) return contact.push_name
   if (contact?.name && contact.name !== formatNumber(jid)) return contact.name
+  // Groups always have a name from the chat object
+  if (isGroup(jid)) return contact?.groupName || "Grupo"
   const num = formatNumber(jid)
-  if (jid?.endsWith("@lid") && !lidToPhone[jid]) return jid.split("@")[0]
-  return num
+  // LID without mapping — try to show something useful
+  if (jid?.endsWith("@lid") && !num) return "Contato " + jid.split("@")[0].slice(-4)
+  return num || jid?.split("@")[0] || "?"
 }
 
 // ── Media ──
@@ -167,7 +175,7 @@ async function tryDownload(msg, mediaType) {
 // ── Message processing ──
 async function processMsg(msg, doDownload) {
   const jid = msg.key?.remoteJid
-  if (!isValidContact(jid)) return null
+  if (!isValidChat(jid)) return null
   const m = msg.message
   if (!m || m.protocolMessage || m.reactionMessage) return null
 
@@ -198,8 +206,17 @@ async function processMsg(msg, doDownload) {
   const quotedMsg = getQuotedMsg(m)
   const status = fromMe ? (msg.status || 1) : undefined
 
+  // For groups, include the participant (sender) info
+  const participant = isGroup(jid) && !fromMe ? (msg.key.participant || jid) : undefined
+  // Resolve participant name
+  let participantName = undefined
+  if (participant) {
+    const pContact = contacts[participant]
+    participantName = pContact?.name || pContact?.phone_book_name || pContact?.push_name || msg.pushName || formatNumber(participant) || undefined
+  }
+
   return {
-    entry: { id: msg.key.id, from: fromMe ? "me" : jid, fromMe, body: body || "", mediaData: mediaData || undefined, mediaType: mediaType || undefined, viewOnce, timestamp: ts, ...(quotedMsg ? { quotedMsg } : {}), ...(status !== undefined ? { status } : {}) },
+    entry: { id: msg.key.id, from: fromMe ? "me" : (participant || jid), fromMe, body: body || "", mediaData: mediaData || undefined, mediaType: mediaType || undefined, viewOnce, timestamp: ts, ...(quotedMsg ? { quotedMsg } : {}), ...(status !== undefined ? { status } : {}), ...(participantName ? { participantName } : {}) },
     jid, ts, fromMe,
   }
 }
@@ -298,13 +315,14 @@ async function startSock() {
 
     broadcast({ type: "sync_progress", batch, chats: Object.keys(contacts).length, syncing: true })
 
-    // Process contacts (phone book names)
+    // Process contacts (phone book names + LID mappings)
     if (histContacts?.length) {
       for (const c of histContacts) {
-        if (!isValidContact(c.id)) continue
-        const name = c.name || c.notify || c.verifiedName || null
+        // Build LID → phone mapping (works for any JID type)
         if (c.lid && c.id?.endsWith("@s.whatsapp.net")) lidToPhone[c.lid] = c.id
         if (c.id?.endsWith("@lid") && c.number) lidToPhone[c.id] = c.number + "@s.whatsapp.net"
+        if (!isValidChat(c.id)) continue
+        const name = c.name || c.notify || c.verifiedName || null
         if (!name) continue
         if (!contacts[c.id]) {
           contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null, push_name: null, pinned: false }
@@ -313,13 +331,26 @@ async function startSock() {
           if (!contacts[c.id].custom_name) contacts[c.id].name = name
         }
       }
+      // After building LID map, update names of LID contacts that now have a phone mapping
+      for (const [lid, phone] of Object.entries(lidToPhone)) {
+        if (contacts[lid] && contacts[lid].name?.startsWith("Contato ")) {
+          // Check if we have the phone contact's name
+          const phoneContact = contacts[phone]
+          if (phoneContact?.phone_book_name) {
+            contacts[lid].name = phoneContact.phone_book_name
+            contacts[lid].phone_book_name = phoneContact.phone_book_name
+          } else {
+            contacts[lid].name = "+" + phone.split("@")[0]
+          }
+        }
+      }
     }
 
     // Process chats — source of truth for pin/archive/existence
     if (histChats?.length) {
       for (const chat of histChats) {
-        if (!isValidContact(chat.id)) continue
-        const name = chat.name || chat.displayName || null
+        if (!isValidChat(chat.id)) continue
+        const name = chat.name || chat.displayName || chat.subject || null
         const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
         const pinned = !!(chat.pin || chat.pinned)
         const archived = !!(chat.archived || chat.archive)
@@ -327,6 +358,11 @@ async function startSock() {
         if (contacts[chat.id]) {
           contacts[chat.id].archived = archived
           contacts[chat.id].pinned = pinned
+          // For groups, store the group name explicitly
+          if (isGroup(chat.id) && name) {
+            contacts[chat.id].groupName = name
+            contacts[chat.id].name = name
+          }
         }
       }
     }
@@ -423,10 +459,11 @@ async function startSock() {
   // ── Contacts from phone book ──
   sock.ev.on("contacts.upsert", async (list) => {
     for (const c of list) {
-      if (!isValidContact(c.id)) continue
-      const name = c.name || c.notify || c.verifiedName || null
+      // Build LID mapping regardless of isValidChat
       if (c.lid && c.id?.endsWith("@s.whatsapp.net")) lidToPhone[c.lid] = c.id
       if (c.id?.endsWith("@lid") && c.number) lidToPhone[c.id] = c.number + "@s.whatsapp.net"
+      if (!isValidChat(c.id)) continue
+      const name = c.name || c.notify || c.verifiedName || null
       if (!name) continue
       if (!contacts[c.id]) {
         contacts[c.id] = { jid: c.id, name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: name, custom_name: null, push_name: null, pinned: false }
@@ -435,9 +472,15 @@ async function startSock() {
         if (!contacts[c.id].custom_name) contacts[c.id].name = name
       }
     }
-    for (const [lid] of Object.entries(lidToPhone)) {
-      if (contacts[lid] && !contacts[lid].custom_name && !contacts[lid].phone_book_name) {
-        contacts[lid].name = formatNumber(lid)
+    // Resolve LID contacts that now have a phone mapping
+    for (const [lid, phone] of Object.entries(lidToPhone)) {
+      if (!contacts[lid] || contacts[lid].custom_name) continue
+      const phoneContact = contacts[phone]
+      if (phoneContact?.phone_book_name) {
+        contacts[lid].name = phoneContact.phone_book_name
+        contacts[lid].phone_book_name = phoneContact.phone_book_name
+      } else if (!contacts[lid].phone_book_name) {
+        contacts[lid].name = "+" + phone.split("@")[0]
       }
     }
     broadcast({ type: "contacts_updated" })
@@ -445,7 +488,7 @@ async function startSock() {
 
   sock.ev.on("contacts.update", async (updates) => {
     for (const c of updates) {
-      if (!isValidContact(c.id) || !contacts[c.id]) continue
+      if (!isValidChat(c.id) || !contacts[c.id]) continue
       const name = c.notify || c.name
       if (!name) continue
       contacts[c.id].phone_book_name = name
@@ -455,7 +498,7 @@ async function startSock() {
 
   // ── Chat list ──
   function syncChatMeta(chat) {
-    if (!isValidContact(chat.id) || !contacts[chat.id]) return
+    if (!isValidChat(chat.id) || !contacts[chat.id]) return
     if (chat.pin !== undefined) contacts[chat.id].pinned = !!chat.pin
     if (chat.pinned !== undefined) contacts[chat.id].pinned = !!chat.pinned
     if (chat.archived !== undefined) contacts[chat.id].archived = !!chat.archived
@@ -464,11 +507,15 @@ async function startSock() {
 
   sock.ev.on("chats.upsert", async (list) => {
     for (const chat of list) {
-      if (!isValidContact(chat.id)) continue
-      const name = chat.name || chat.displayName || null
+      if (!isValidChat(chat.id)) continue
+      const name = chat.name || chat.displayName || chat.subject || null
       const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
       upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
       syncChatMeta(chat)
+      if (isGroup(chat.id) && name && contacts[chat.id]) {
+        contacts[chat.id].groupName = name
+        contacts[chat.id].name = name
+      }
     }
     broadcast({ type: "chats_loaded" })
   })
@@ -477,18 +524,22 @@ async function startSock() {
     if (!chatList?.length) return
     console.log(`chats.set: ${chatList.length} chats`)
     for (const chat of chatList) {
-      if (!isValidContact(chat.id)) continue
-      const name = chat.name || chat.displayName || null
+      if (!isValidChat(chat.id)) continue
+      const name = chat.name || chat.displayName || chat.subject || null
       const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
       upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
       syncChatMeta(chat)
+      if (isGroup(chat.id) && name && contacts[chat.id]) {
+        contacts[chat.id].groupName = name
+        contacts[chat.id].name = name
+      }
     }
     broadcast({ type: "chats_loaded" })
   })
 
   sock.ev.on("chats.update", async (updates) => {
     for (const update of updates) {
-      if (!isValidContact(update.id)) continue
+      if (!isValidChat(update.id)) continue
 
       // Chat deleted on phone
       if (update.delete || update.clear) {
@@ -535,6 +586,35 @@ async function startSock() {
       console.log(`Chat deleted (chats.delete): ${jid}`)
       delete contacts[jid]
       delete messages[jid]
+    }
+    broadcast({ type: "contacts_updated" })
+  })
+
+  // ── Group metadata updates ──
+  sock.ev.on("groups.upsert", async (groups) => {
+    for (const g of groups) {
+      const jid = g.id
+      if (!jid || !isGroup(jid)) continue
+      const name = g.subject || g.name || null
+      if (!name) continue
+      if (!contacts[jid]) {
+        contacts[jid] = { jid, name, groupName: name, lastMessage: "", timestamp: 0, unread: 0, archived: false, phone_book_name: null, custom_name: null, push_name: null, pinned: false }
+      } else {
+        contacts[jid].groupName = name
+        if (!contacts[jid].custom_name) contacts[jid].name = name
+      }
+    }
+    broadcast({ type: "contacts_updated" })
+  })
+
+  sock.ev.on("groups.update", async (updates) => {
+    for (const g of updates) {
+      const jid = g.id
+      if (!jid || !contacts[jid]) continue
+      if (g.subject) {
+        contacts[jid].groupName = g.subject
+        if (!contacts[jid].custom_name) contacts[jid].name = g.subject
+      }
     }
     broadcast({ type: "contacts_updated" })
   })
@@ -586,7 +666,7 @@ async function startSock() {
   sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
     for (const msg of msgs) {
       const jid = msg.key?.remoteJid
-      if (!isValidContact(jid)) continue
+      if (!isValidChat(jid)) continue
       if (type !== "notify" && type !== "append") continue
 
       const doDownload = type === "notify"
