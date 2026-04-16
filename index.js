@@ -81,6 +81,7 @@ let connected = false
 let messages = {}    // jid -> [{ id, from, fromMe, body, mediaType, mediaData, viewOnce, timestamp, status, quotedMsg }]
 let contacts = {}    // jid -> { jid, name, lastMessage, timestamp, unread, archived, pinned, phone_book_name, custom_name, push_name }
 let lidToPhone = {}  // LID -> phone JID mapping
+let rawMessages = {} // msgId -> raw Baileys message object (for media download on demand)
 
 function broadcast(data) {
   const json = JSON.stringify(data)
@@ -208,15 +209,38 @@ async function processMsg(msg, doDownload) {
 
   // For groups, include the participant (sender) info
   const participant = isGroup(jid) && !fromMe ? (msg.key.participant || jid) : undefined
-  // Resolve participant name
   let participantName = undefined
   if (participant) {
     const pContact = contacts[participant]
     participantName = pContact?.name || pContact?.phone_book_name || pContact?.push_name || msg.pushName || formatNumber(participant) || undefined
   }
 
+  // Document filename
+  const fileName = m?.documentMessage?.fileName || undefined
+  // Mime type for download
+  const mimetype = m?.documentMessage?.mimetype || m?.imageMessage?.mimetype || m?.videoMessage?.mimetype || m?.audioMessage?.mimetype || undefined
+
+  // Cache raw message for on-demand media download
+  if (mediaType && !viewOnce) {
+    rawMessages[msg.key.id] = msg
+    // Keep cache bounded (max 2000 entries)
+    const keys = Object.keys(rawMessages)
+    if (keys.length > 2000) {
+      for (let i = 0; i < keys.length - 2000; i++) delete rawMessages[keys[i]]
+    }
+  }
+
   return {
-    entry: { id: msg.key.id, from: fromMe ? "me" : (participant || jid), fromMe, body: body || "", mediaData: mediaData || undefined, mediaType: mediaType || undefined, viewOnce, timestamp: ts, ...(quotedMsg ? { quotedMsg } : {}), ...(status !== undefined ? { status } : {}), ...(participantName ? { participantName } : {}) },
+    entry: {
+      id: msg.key.id, from: fromMe ? "me" : (participant || jid), fromMe,
+      body: body || "", mediaData: mediaData || undefined,
+      mediaType: mediaType || undefined, viewOnce, timestamp: ts,
+      ...(quotedMsg ? { quotedMsg } : {}),
+      ...(status !== undefined ? { status } : {}),
+      ...(participantName ? { participantName } : {}),
+      ...(fileName ? { fileName } : {}),
+      ...(mimetype ? { mimetype } : {}),
+    },
     jid, ts, fromMe,
   }
 }
@@ -275,6 +299,7 @@ async function startSock() {
     messages = {}
     contacts = {}
     lidToPhone = {}
+    rawMessages = {}
     wantFullSync = false
   }
 
@@ -352,12 +377,16 @@ async function startSock() {
         if (!isValidChat(chat.id)) continue
         const name = chat.name || chat.displayName || chat.subject || null
         const ts = typeof chat.conversationTimestamp === "object" ? Number(chat.conversationTimestamp) : (chat.conversationTimestamp || 0)
-        const pinned = !!(chat.pin || chat.pinned)
-        const archived = !!(chat.archived || chat.archive)
+        // pin can be a timestamp (>0 = pinned), boolean, or number
+        const pinRaw = chat.pin ?? chat.pinned ?? 0
+        const pinned = typeof pinRaw === "number" ? pinRaw > 0 : !!pinRaw
+        const archiveRaw = chat.archived ?? chat.archive ?? false
+        const archived = !!archiveRaw
         upsertContact(chat.id, name, ts, chat.unreadCount || 0, null)
         if (contacts[chat.id]) {
           contacts[chat.id].archived = archived
           contacts[chat.id].pinned = pinned
+          if (pinned) console.log(`  📌 Fixado: ${contacts[chat.id].name || chat.id}`)
           // For groups, store the group name explicitly
           if (isGroup(chat.id) && name) {
             contacts[chat.id].groupName = name
@@ -499,8 +528,10 @@ async function startSock() {
   // ── Chat list ──
   function syncChatMeta(chat) {
     if (!isValidChat(chat.id) || !contacts[chat.id]) return
-    if (chat.pin !== undefined) contacts[chat.id].pinned = !!chat.pin
-    if (chat.pinned !== undefined) contacts[chat.id].pinned = !!chat.pinned
+    if (chat.pin !== undefined || chat.pinned !== undefined) {
+      const pinRaw = chat.pin ?? chat.pinned ?? 0
+      contacts[chat.id].pinned = typeof pinRaw === "number" ? pinRaw > 0 : !!pinRaw
+    }
     if (chat.archived !== undefined) contacts[chat.id].archived = !!chat.archived
     else if (chat.archive !== undefined) contacts[chat.id].archived = !!chat.archive
   }
@@ -563,7 +594,8 @@ async function startSock() {
         c.archived = !!(update.archive ?? update.archived)
       }
       if (update.pin !== undefined || update.pinned !== undefined) {
-        c.pinned = !!(update.pin ?? update.pinned)
+        const pinRaw = update.pin ?? update.pinned ?? 0
+        c.pinned = typeof pinRaw === "number" ? pinRaw > 0 : !!pinRaw
       }
 
       // Mute -1 can mean deleted in some Baileys versions
@@ -725,6 +757,44 @@ app.get("/profile-pic/:jid", async (req, res) => {
   if (!sock || !connected) return res.json({ url: null })
   try { res.json({ url: await sock.profilePictureUrl(jid, "image") }) }
   catch { res.json({ url: null }) }
+})
+
+// Download media from a message (on demand)
+app.get("/download/:msgId", async (req, res) => {
+  const msgId = decodeURIComponent(req.params.msgId)
+  const raw = rawMessages[msgId]
+  if (!raw) return res.status(404).json({ error: "Mensagem não encontrada no cache" })
+  if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
+  try {
+    const buffer = await downloadMediaMessage(raw, "buffer", {}, { logger, reuploadRequest: sock?.updateMediaMessage })
+    if (!buffer || buffer.length === 0) return res.status(404).json({ error: "Mídia indisponível" })
+    const m = raw.message
+    const mime = m?.documentMessage?.mimetype || m?.imageMessage?.mimetype || m?.videoMessage?.mimetype || m?.audioMessage?.mimetype || m?.stickerMessage?.mimetype || "application/octet-stream"
+    const fileName = m?.documentMessage?.fileName || `media_${msgId}`
+    const b64 = buffer.toString("base64")
+    res.json({ data: `data:${mime};base64,${b64}`, mimetype: mime, fileName, size: buffer.length })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// List all media from a conversation (for info panel)
+app.get("/media/:jid", (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  const msgs = messages[jid] || []
+  const media = { images: [], videos: [], audio: [], documents: [] }
+  for (const m of msgs) {
+    if (!m.mediaType) continue
+    const item = { id: m.id, timestamp: m.timestamp, fromMe: m.fromMe, fileName: m.fileName, mimetype: m.mimetype, body: m.body }
+    if (m.mediaType === "image" || m.mediaType === "sticker") {
+      media.images.push({ ...item, thumbnail: m.mediaData || null })
+    } else if (m.mediaType === "video") {
+      media.videos.push(item)
+    } else if (m.mediaType === "audio") {
+      media.audio.push(item)
+    } else if (m.mediaType === "document") {
+      media.documents.push(item)
+    }
+  }
+  res.json(media)
 })
 
 app.post("/send", async (req, res) => {
