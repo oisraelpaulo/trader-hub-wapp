@@ -250,16 +250,26 @@ function upsertContact(jid, pushName, ts, unreadDelta, lastMsg) {
   const existing = contacts[jid]
   if (!existing) {
     contacts[jid] = {
-      jid, name: resolveName(jid, null, pushName),
+      jid, name: isGroup(jid) ? (pushName || "Grupo") : resolveName(jid, null, pushName),
       lastMessage: lastMsg || "", timestamp: ts || 0,
       unread: unreadDelta || 0, archived: false,
       phone_book_name: null, custom_name: null,
-      push_name: pushName || null, pinned: false,
+      push_name: isGroup(jid) ? null : (pushName || null), pinned: false,
+      ...(isGroup(jid) && pushName ? { groupName: pushName } : {}),
     }
   } else {
-    if (pushName && !existing.push_name) existing.push_name = pushName
-    if (!existing.custom_name && !existing.phone_book_name) {
-      existing.name = resolveName(jid, existing, pushName)
+    // For groups: never overwrite name with a participant's pushName
+    if (isGroup(jid)) {
+      // Only update group name if explicitly passed as group name (not participant)
+      if (pushName && !existing.groupName) {
+        existing.groupName = pushName
+        if (!existing.custom_name) existing.name = pushName
+      }
+    } else {
+      if (pushName && !existing.push_name) existing.push_name = pushName
+      if (!existing.custom_name && !existing.phone_book_name) {
+        existing.name = resolveName(jid, existing, pushName)
+      }
     }
     if (ts && ts > existing.timestamp) existing.timestamp = ts
     if (lastMsg) existing.lastMessage = lastMsg
@@ -434,7 +444,7 @@ async function startSock() {
       const contactCount = Object.keys(contacts).length
       console.log(`WhatsApp conectado! (${contactCount} contatos em memória)`)
 
-      // Send presence update and try to trigger history sync
+      // After connection: presence + active fetch if empty
       setTimeout(async () => {
         if (!sock || !connected) return
         try {
@@ -442,26 +452,48 @@ async function startSock() {
           console.log("Presence updated")
         } catch (e) { console.error("Presence error:", e.message) }
 
-        // If memory is empty, try requesting history sync
-        if (Object.keys(contacts).length === 0) {
-          console.log("Memória vazia, solicitando history sync...")
+        // Actively fetch groups (always, to get proper names)
+        try {
+          const groups = await sock.groupFetchAllParticipating()
+          let count = 0
+          for (const [gid, meta] of Object.entries(groups)) {
+            if (!isGroup(gid)) continue
+            const name = meta.subject || meta.name || null
+            if (!contacts[gid]) {
+              contacts[gid] = {
+                jid: gid, name: name || "Grupo", groupName: name, lastMessage: "",
+                timestamp: meta.subjectTime || 0, unread: 0, archived: false,
+                phone_book_name: null, custom_name: null, push_name: null, pinned: false,
+              }
+            } else if (name) {
+              contacts[gid].groupName = name
+              if (!contacts[gid].custom_name) contacts[gid].name = name
+            }
+            count++
+          }
+          if (count > 0) {
+            console.log(`Active fetch: ${count} grupos`)
+            broadcast({ type: "chats_loaded" })
+          }
+        } catch (e) { console.error("Group fetch error:", e.message) }
+
+        // If memory is still empty, try requesting history
+        if (Object.keys(contacts).filter(j => !isGroup(j)).length === 0) {
+          console.log("Sem contatos individuais, tentando history sync...")
           try {
-            // Baileys v7: request history sync explicitly
             if (sock.fetchMessageHistory) {
-              await sock.fetchMessageHistory(50, undefined, undefined)
+              await sock.fetchMessageHistory(100, undefined, undefined)
               console.log("fetchMessageHistory chamado")
             }
           } catch (e) { console.error("History request error:", e.message) }
         }
 
-        // Check status after 20s
+        // Status check after 20s
         setTimeout(() => {
           const count = Object.keys(contacts).length
-          const msgCount = Object.keys(messages).length
-          console.log(`Status: ${count} contatos, ${msgCount} conversas com msgs`)
-          if (count === 0) {
-            console.log("Ainda vazio — use SINCRONIZAR ou reconecte o celular.")
-          }
+          const msgCount = Object.keys(messages).reduce((sum, jid) => sum + messages[jid].length, 0)
+          console.log(`Status: ${count} contatos, ${msgCount} msgs total`)
+          if (count === 0) console.log("Vazio — use SINCRONIZAR no app")
           broadcast({ type: "chats_loaded" })
         }, 20000)
       }, 3000)
@@ -708,7 +740,8 @@ async function startSock() {
 
       addMessage(jid, entry)
 
-      const pushName = (!fromMe && msg.pushName) ? msg.pushName : null
+      // For groups: don't pass participant's pushName as the contact name
+      const pushName = (!fromMe && !isGroup(jid) && msg.pushName) ? msg.pushName : null
       const lastMsg = entry.body || mediaLabel(entry.mediaType, null)
       upsertContact(jid, pushName, entry.timestamp, fromMe ? 0 : 1, lastMsg)
 
@@ -961,27 +994,64 @@ app.post("/disconnect", async (_, res) => {
   res.json({ ok: true })
 })
 
-// ── Full sync: reconnect socket to trigger fresh history sync ──
+// ── Full sync: actively fetch groups + trigger resync ──
 app.post("/sync", async (_, res) => {
   if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
   const before = Object.keys(contacts).length
-  console.log(`Full sync requested. ${before} contacts. Reconnecting...`)
+  console.log(`Full sync requested. ${before} contacts.`)
+  broadcast({ type: "sync_progress", batch: 0, chats: before, syncing: true })
 
-  wantFullSync = true  // startSock will clear memory
+  try {
+    // 1. Actively fetch all groups
+    console.log("Fetching groups...")
+    const groups = await sock.groupFetchAllParticipating()
+    let groupCount = 0
+    for (const [gid, meta] of Object.entries(groups)) {
+      if (!isGroup(gid)) continue
+      const name = meta.subject || meta.name || null
+      if (!contacts[gid]) {
+        contacts[gid] = {
+          jid: gid, name: name || "Grupo", groupName: name, lastMessage: "",
+          timestamp: meta.subjectTime || 0, unread: 0, archived: false,
+          phone_book_name: null, custom_name: null, push_name: null, pinned: false,
+        }
+      } else if (name) {
+        contacts[gid].groupName = name
+        if (!contacts[gid].custom_name) contacts[gid].name = name
+      }
+      groupCount++
+    }
+    console.log(`  → ${groupCount} grupos encontrados`)
+  } catch (e) { console.error("Group fetch error:", e.message) }
 
+  try {
+    // 2. Presence update to trigger sync events
+    if (sock.sendPresenceUpdate) await sock.sendPresenceUpdate("available")
+  } catch {}
+
+  try {
+    // 3. Try to request message history (Baileys v7)
+    if (sock.fetchMessageHistory) {
+      console.log("Requesting message history...")
+      await sock.fetchMessageHistory(100, undefined, undefined)
+    }
+  } catch (e) { console.error("fetchMessageHistory error:", e.message) }
+
+  // 4. Reconnect socket to trigger history sync events
+  console.log("Reconnecting socket for history sync...")
   try {
     sock.ev.removeAllListeners()
     sock.ws.close()
   } catch {}
   sock = null
 
-  setTimeout(startSock, 1500)
+  setTimeout(startSock, 2000)
 
-  broadcast({ type: "sync_progress", batch: 0, chats: before, syncing: true })
-  res.json({ ok: true, contacts: before, message: "Re-syncing..." })
+  const after = Object.keys(contacts).length
+  res.json({ ok: true, contacts: after, message: `Sync: ${after} contatos. Reconectando...` })
 })
 
-// ── Hard sync: clear auth + reconnect (requires new QR scan) ──
+// ── Hard sync: clear auth + reconnect (requires new QR scan but guarantees full sync) ──
 app.post("/sync-hard", async (_, res) => {
   console.log("Hard sync: limpando auth para forçar novo QR + history sync completo")
 
