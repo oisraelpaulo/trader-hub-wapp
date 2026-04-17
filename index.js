@@ -790,10 +790,61 @@ app.get("/directory", (_, res) => {
   res.json(list)
 })
 
-app.get("/messages/:jid", (req, res) => {
+// Track pending history fetches to avoid duplicates
+const pendingHistoryFetch = {}
+
+async function requestChatHistory(jid) {
+  if (!sock || !connected || !sock.fetchMessageHistory) return false
+  if (pendingHistoryFetch[jid]) return false // already fetching
+
+  const msgs = messages[jid] || []
+  // Use the oldest message we have as cursor, or create a synthetic one
+  let oldestKey, oldestTs
+  if (msgs.length > 0) {
+    const oldest = msgs[0]
+    oldestKey = { remoteJid: jid, fromMe: oldest.fromMe || false, id: oldest.id }
+    oldestTs = (oldest.timestamp || 0) * 1000 // needs ms
+  } else {
+    // No messages at all — create a synthetic key requesting recent messages
+    oldestKey = { remoteJid: jid, fromMe: false, id: "FFFFFFFFFFFFFFFF" }
+    oldestTs = Date.now()
+  }
+
+  try {
+    pendingHistoryFetch[jid] = true
+    console.log(`Requesting history for ${contacts[jid]?.name || jid} (${msgs.length} msgs in memory)`)
+    await sock.fetchMessageHistory(50, oldestKey, oldestTs)
+    // History arrives via messaging-history.set event asynchronously
+    // Clean up after 30s
+    setTimeout(() => { delete pendingHistoryFetch[jid] }, 30000)
+    return true
+  } catch (e) {
+    console.log(`History fetch error for ${jid}:`, e.message)
+    delete pendingHistoryFetch[jid]
+    return false
+  }
+}
+
+app.get("/messages/:jid", async (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (contacts[jid]) contacts[jid].unread = 0
-  res.json((messages[jid] || []).slice(-500))
+
+  const msgs = messages[jid] || []
+  const contact = contacts[jid]
+
+  // Check if messages are stale compared to contact timestamp
+  if (contact && sock && connected) {
+    const newestMsgTs = msgs.length > 0 ? Math.max(...msgs.map(m => m.timestamp || 0)) : 0
+    const contactTs = contact.timestamp || 0
+    const gap = contactTs - newestMsgTs
+
+    // If contact has activity >5min newer than our newest message, or we have very few messages
+    if ((gap > 300 && msgs.length < 50) || msgs.length === 0) {
+      requestChatHistory(jid) // fire and forget — results arrive via event
+    }
+  }
+
+  res.json(msgs.slice(-500))
 })
 
 app.get("/profile-pic/:jid", async (req, res) => {
