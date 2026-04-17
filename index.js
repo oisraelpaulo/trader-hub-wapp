@@ -281,7 +281,7 @@ function addMessage(jid, entry) {
   if (!messages[jid]) messages[jid] = []
   if (messages[jid].find(e => e.id === entry.id)) return false
   messages[jid].push(entry)
-  if (messages[jid].length > 100) messages[jid] = messages[jid].slice(-100)
+  if (messages[jid].length > 500) messages[jid] = messages[jid].slice(-500)
   return true
 }
 
@@ -620,7 +620,18 @@ async function startSock() {
         ? (typeof update.conversationTimestamp === "object" ? Number(update.conversationTimestamp) : update.conversationTimestamp)
         : null
       if (ts && ts > (c.timestamp || 0)) c.timestamp = ts
-      if (update.unreadCount !== undefined) c.unread = update.unreadCount
+      if (update.unreadCount !== undefined) {
+        c.unread = update.unreadCount
+        // When read on phone (unreadCount=0), update all message statuses to read
+        if (update.unreadCount === 0 && messages[update.id]) {
+          for (const msg of messages[update.id]) {
+            if (msg.fromMe && msg.status && msg.status < 4) {
+              msg.status = 4
+              broadcast({ type: "message_update", jid: update.id, id: msg.id, status: 4 })
+            }
+          }
+        }
+      }
 
       if (update.archive !== undefined || update.archived !== undefined) {
         c.archived = !!(update.archive ?? update.archived)
@@ -782,7 +793,7 @@ app.get("/directory", (_, res) => {
 app.get("/messages/:jid", (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (contacts[jid]) contacts[jid].unread = 0
-  res.json((messages[jid] || []).slice(-100))
+  res.json((messages[jid] || []).slice(-500))
 })
 
 app.get("/profile-pic/:jid", async (req, res) => {
@@ -981,9 +992,22 @@ app.delete("/message/:jid/:msgId", async (req, res) => {
 app.post("/read/:jid", async (req, res) => {
   const jid = decodeURIComponent(req.params.jid)
   if (contacts[jid]) contacts[jid].unread = 0
-  // Mark as read on WhatsApp
+  // Mark as read on WhatsApp — send actual message keys for unread messages
   if (sock && connected) {
-    try { await sock.readMessages([{ remoteJid: jid, id: undefined }]) } catch {}
+    try {
+      const msgs = messages[jid] || []
+      const unreadKeys = msgs.filter(m => !m.fromMe).slice(-20).map(m => ({
+        remoteJid: jid,
+        id: m.id,
+        participant: m.participant || undefined,
+      }))
+      if (unreadKeys.length > 0) {
+        await sock.readMessages(unreadKeys)
+      } else {
+        // Fallback: try chatModify markRead
+        await sock.chatModify({ markRead: false, lastMessages: [] }, jid)
+      }
+    } catch (e) { console.log("read error:", e.message) }
   }
   res.json({ ok: true })
 })
