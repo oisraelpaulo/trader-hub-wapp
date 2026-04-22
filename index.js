@@ -718,7 +718,33 @@ async function startSock() {
     }
   })
 
-  sock.ev.on("messages.reaction", () => {})
+  // ── Presence updates (typing, online, offline) ──
+  sock.ev.on("presence.update", ({ id, presences }) => {
+    if (!presences) return
+    for (const [participant, presence] of Object.entries(presences)) {
+      const status = presence?.lastKnownPresence || "unavailable"
+      broadcast({ type: "presence", jid: id, participant, status })
+    }
+  })
+
+  // ── Message reactions ──
+  sock.ev.on("messages.reaction", (reactions) => {
+    for (const { key, reaction } of reactions) {
+      const jid = key?.remoteJid
+      if (!jid || !messages[jid]) continue
+      const msg = messages[jid].find(m => m.id === key.id)
+      if (!msg) continue
+      if (!msg.reactions) msg.reactions = []
+      const existing = msg.reactions.findIndex(r => r.key === reaction.key?.participant || r.key === reaction.key?.id)
+      if (reaction.text) {
+        if (existing >= 0) msg.reactions[existing].text = reaction.text
+        else msg.reactions.push({ key: reaction.key?.participant || reaction.key?.id, text: reaction.text })
+      } else if (existing >= 0) {
+        msg.reactions.splice(existing, 1)
+      }
+      broadcast({ type: "message_update", jid, id: key.id, reactions: msg.reactions })
+    }
+  })
 
   // ── Historical messages (bulk) ──
   sock.ev.on("messages.set", async ({ messages: msgs }) => {
@@ -1012,6 +1038,38 @@ app.post("/read/:jid", async (req, res) => {
     } catch (e) { console.log("read error:", e.message) }
   }
   res.json({ ok: true })
+})
+
+// Subscribe to presence updates for a contact
+app.post("/subscribe/:jid", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
+  try { await sock.presenceSubscribe(jid) } catch {}
+  res.json({ ok: true })
+})
+
+// Send reaction to a message
+app.post("/react/:jid/:msgId", async (req, res) => {
+  const jid = decodeURIComponent(req.params.jid)
+  const msgId = decodeURIComponent(req.params.msgId)
+  const { emoji } = req.body // empty string = remove reaction
+  if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
+  try {
+    await sock.sendMessage(jid, { react: { text: emoji || "", key: { remoteJid: jid, id: msgId, fromMe: false } } })
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Forward a message to another chat
+app.post("/forward", async (req, res) => {
+  const { fromJid, toJid, msgId } = req.body
+  if (!sock || !connected) return res.status(503).json({ error: "Desconectado" })
+  const raw = rawMessages[msgId]
+  if (!raw) return res.status(404).json({ error: "Mensagem nao encontrada" })
+  try {
+    await sock.sendMessage(toJid, { forward: raw })
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.post("/disconnect", async (_, res) => {
